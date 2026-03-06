@@ -1,0 +1,13 @@
+{
+  "model": {
+    "model_name_or_path": "Qwen/Qwen2.5-0.5B",
+    "torch_dtype": "bf16",
+    "trust_remote_code": false
+  },
+  "memory_dimensions": {
+    "hidden_dim": 896,
+    "key_dim": 192,
+    "value_dim": 192
+  }
+}
+
