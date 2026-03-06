@@ -80,18 +80,25 @@ This matches the required logic:
 
 ## Train Command
 
+Install dependencies first:
+
+```bash
+cd IMM
+pip install -r requirements.txt
+```
+
 Use YAML for all hyperparameters:
 
 ```bash
-cd /home/jinyang_wang/Dev/LLM/IMM/src
-python -m imm_qwen.train --config examples/train_config.example.yaml
+cd IMM
+PYTHONPATH=src python -m imm_qwen.train --config examples/train_config.example.yaml
 ```
 
 Or with script:
 
 ```bash
-cd /home/jinyang_wang/Dev/LLM/IMM/src
-bash scripts/run_train.sh examples/train_config.example.yaml
+cd IMM
+bash src/scripts/run_train.sh examples/train_config.example.yaml
 ```
 
 ## Notes
