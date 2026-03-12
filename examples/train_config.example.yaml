@@ -1,35 +1,60 @@
 model:
+  # Base checkpoint to load from Hugging Face or a local model directory.
   model_name_or_path: "Qwen/Qwen2.5-0.5B"
+  # Weight dtype used when loading the base model. Common choices: bf16, fp16, fp32.
   torch_dtype: "bf16"
+  # Enable only for model repos that require custom Python code from the source repo.
   trust_remote_code: false
 
 memory_dimensions:
+  # Documented IMM input hidden size. It should match the model hidden size.
+  # Note: the current trainer derives the actual hidden size from the loaded model.
   hidden_dim: 896
+  # Size of the memory key vectors used for memory lookup.
   key_dim: 192
+  # Size of the memory value vectors retrieved and merged back into the model.
   value_dim: 192
 
 memory_slots:
+  # Number of long-term session-memory entries kept per sample.
   session_slots: 64
+  # Number of short-term working-memory entries kept per sample.
   working_slots: 16
 
 turn_summary:
+  # How one full turn is compressed before writing it into memory.
+  # Supported values: last_token, mean_pool, attention_pool.
   pooling_strategy: "last_token"
+  # Apply LayerNorm to the compressed turn summary before writing it to memory.
   use_layer_norm: true
 
 controller:
+  # Strength of the retrieved session-memory contribution during merge.
+  # 0.0 disables the session-memory effect; 1.0 keeps full strength.
   session_merge_gate: 1.0
+  # Whether to read and write the short-term working-memory bank.
+  # Disable for a simpler and cheaper session-memory-only setup.
   use_working_memory: false
+  # Strength of the retrieved working-memory contribution during merge.
   working_merge_gate: 1.0
 
 placement:
+  # Master switch for inserting IMM modules into the transformer.
   enable_imm: true
+  # If explicit layer indices are not provided, IMM is inserted into the top
+  # fraction of decoder layers. For example, 0.5 means the top half of layers.
   top_fraction: 0.5
 
 lora:
+  # Enable PEFT LoRA adapters on the target modules below.
   enabled: true
+  # Low-rank adapter size. Larger rank increases capacity and trainable parameters.
   rank: 8
+  # LoRA scaling factor applied to the adapter output.
   alpha: 16
+  # Dropout used inside LoRA adapters during training.
   dropout: 0.05
+  # Base-model submodules that receive LoRA adapters.
   target_modules:
     - "q_proj"
     - "k_proj"
@@ -38,30 +63,55 @@ lora:
     - "gate_proj"
     - "up_proj"
     - "down_proj"
+  # PEFT bias mode. "none" keeps only LoRA weights trainable.
   bias: "none"
+  # PEFT task type for causal language modeling.
   task_type: "CAUSAL_LM"
 
 data:
+  # Path to the supervised training dataset JSON file.
   dataset_path: "../v1_train_sample.json"
+  # Maximum token length for the present-turn training sequence
+  # after prompt + target are combined and tokenized.
   max_length: 1024
+  # Maximum token length for each individual history line during memory prefill.
   max_history_line_length: 256
+  # Maximum number of history lines to keep per sample.
   max_history_lines: 16
+  # Whether to parse `history` and prefill session memory from it.
   include_history: true
+  # Append the tokenizer EOS token to each target answer if available.
   append_eos_token: true
+  # Build the history-lookup mask from supervised labels so prompt tokens do not
+  # read history while target tokens are allowed to read history.
   derive_history_lookup_mask_from_labels: true
 
 training:
+  # Use Hugging Face Accelerate to prepare the model, optimizer, and dataloader.
   use_accelerate: true
+  # Mixed precision mode passed to Accelerate. Common values: bf16, fp16, no.
   mixed_precision: "bf16"
+  # Learning rate for LoRA parameters.
   learning_rate_lora: 2.0e-4
+  # Learning rate for IMM and other non-LoRA trainable parameters.
   learning_rate_imm: 2.0e-4
+  # AdamW weight decay applied to trainable parameter groups.
   weight_decay: 0.01
+  # Per-step micro-batch size before gradient accumulation.
   batch_size: 4
+  # Number of full passes over the dataset.
   num_epochs: 3
+  # Number of steps to accumulate gradients before each optimizer update.
   grad_accum_steps: 1
+  # Gradient clipping threshold for stabilizing training.
   max_grad_norm: 1.0
+  # Print training loss every N global steps. Use a positive integer.
   log_every_steps: 10
+  # Reserved for periodic checkpoint saving.
+  # Note: the current trainer saves only once at the end, so this is not used yet.
   save_every_steps: 0
+  # Directory where the final tokenizer and model artifacts are saved.
   output_dir: "outputs/imm_qwen"
+  # Random seed for reproducible data order and initialization behavior.
   seed: 42
 

@@ -109,3 +109,67 @@ bash src/scripts/run_train.sh examples/train_config.example.yaml
   - `accelerate` (if `training.use_accelerate: true`)
   - `pyyaml`
 
+## Model Structure (How IMM is wired into Qwen)
+
+This project keeps the Hugging Face Qwen model mostly intact and injects IMM by **wrapping selected decoder layers in place**.
+
+- **High-level components**
+  - **Base model**: a standard `AutoModelForCausalLM` (Qwen).
+  - **`QwenImmAdapter`** (`imm_qwen/modeling_imm.py`): owns the base model and replaces some decoder layers with IMM-enabled wrappers.
+  - **`QwenImmLayerWrapper`**: wraps one decoder layer; runs the original layer first, then applies IMM to its output hidden states.
+  - **`ImplicitMemoryModule` (IMM core)**: does “read → gated merge” during forward; does “turn summary → write” when requested.
+  - **`MultiScopeMemoryState`** (`imm_qwen/memory_state.py`): two memory banks per sample:
+    - **`session`**: long-term turn-level memory (history/past turns)
+    - **`working`**: short-term scratch memory (optional; often disabled for efficiency)
+  - **`RuleBasedMemoryController`** (`imm_qwen/controller.py`): applies deterministic gates and enforces the `history_lookup_mask` rule.
+
+- **Layer placement**
+  - Controlled by `placement` config.
+  - If `placement.enable_imm: false`, no layers are wrapped.
+  - If `selected_layer_indices` is not provided, the adapter wraps the **top `top_fraction`** of decoder layers (e.g. 0.5 → top half).
+
+- **Forward pass: what happens inside a wrapped layer**
+
+  Conceptually, a wrapped layer computes:
+
+  1. Run the original Qwen decoder layer to get `hidden_states` \([B, T, H]\).
+  2. IMM computes a query per token: `query = query_proj(hidden_states)` \([B, T, key_dim]\).
+  3. IMM reads memory:
+     - `session` read is conditioned by `history_lookup_mask`.
+     - `working` read happens only if `controller.use_working_memory: true`.
+  4. Controller applies **gated merge**:
+     - A scalar gate (`session_merge_gate` / `working_merge_gate`) scales retrieved vectors.
+     - `history_lookup_mask` blocks history usage at masked tokens:
+       - `True`  ⇒ masked ⇒ do **not** merge retrieved memory at that token
+       - `False` ⇒ allowed ⇒ merge retrieved memory at that token
+  5. Retrieved values are projected back to hidden size and added as a residual:
+     - `hidden_out = LayerNorm(hidden_states + output_proj(working + session))`
+
+  You can think of the per-layer structure like this:
+
+  ```text
+  tokens → [Qwen decoder layer] → hidden_states
+                                 │
+                                 ├─ IMM read: query_proj → memory_state.read(session/working)
+                                 ├─ IMM gate: controller.merge_gate (+ history_lookup_mask)
+                                 └─ IMM merge: output_proj + residual + LayerNorm → hidden_out
+  ```
+
+- **Memory write: how a “turn summary” is created**
+  - IMM writes are turn-level (one vector per sequence / per history line), not per-token.
+  - The write path compresses \([B, T, H]\) into \([B, value_dim]\) using `turn_summary.pooling_strategy`:
+    - `last_token`: take the last non-padding token hidden state (via `attention_mask`)
+    - `mean_pool`: mean over unmasked tokens
+    - `attention_pool`: learned attention weights over tokens
+  - The summary is optionally normalized (`turn_summary.use_layer_norm`), then projected into:
+    - **write key** (`write_key_proj(summary)`) for retrieval addressing
+    - **write value** (`write_value_proj(summary)`) for what will be retrieved/merged later
+
+- **Where writes happen in this repo**
+  - **Training** (`imm_qwen/train_tools.py` + `imm_qwen/train.py`):
+    - History is split into lines.
+    - Each history line is forwarded once and written into **session memory** as a summary (“prefill”).
+    - Then the present turn is trained with LM loss while being allowed to read session memory only on target tokens (via `history_lookup_mask`).
+  - **Inference** (`imm_qwen/infer_tools.py`):
+    - After producing an assistant response, the current turn is summarized and written into **session memory** so later turns can retrieve it.
+
