@@ -117,24 +117,38 @@ def build_model_with_imm(project_config: ImmQwenProjectConfig) -> TrainBuildArti
 
 
 def resolve_imm_adapter(model: torch.nn.Module) -> QwenImmAdapter:
-    if isinstance(model, QwenImmAdapter):
-        return model
-    if hasattr(model, "module"):
-        module = getattr(model, "module")
-        if isinstance(module, QwenImmAdapter):
-            return module
-    # Handle PEFT and similar wrappers.
-    candidate_attrs = ("base_model", "model")
-    for attr_name in candidate_attrs:
-        if hasattr(model, attr_name):
-            nested = getattr(model, attr_name)
-            if isinstance(nested, QwenImmAdapter):
-                return nested
-            if isinstance(nested, torch.nn.Module):
-                try:
-                    return resolve_imm_adapter(nested)
-                except ValueError:
-                    pass
+    # Iteratively unwrap common wrapper attributes while guarding against
+    # self-referential links (e.g. base_model property returning self).
+    pending_models: List[torch.nn.Module] = [model]
+    visited_model_ids = set()
+    candidate_attrs = ("module", "base_model", "model")
+
+    while pending_models:
+        current_model = pending_models.pop()
+        model_id = id(current_model)
+        if model_id in visited_model_ids:
+            continue
+        visited_model_ids.add(model_id)
+
+        if isinstance(current_model, QwenImmAdapter):
+            return current_model
+
+        for attr_name in candidate_attrs:
+            try:
+                nested_model = getattr(current_model, attr_name)
+            except AttributeError:
+                continue
+
+            if isinstance(nested_model, QwenImmAdapter):
+                return nested_model
+
+            if not isinstance(nested_model, torch.nn.Module):
+                continue
+            if id(nested_model) == model_id:
+                continue
+
+            pending_models.append(nested_model)
+
     raise ValueError("Cannot resolve QwenImmAdapter from the provided model.")
 
 
