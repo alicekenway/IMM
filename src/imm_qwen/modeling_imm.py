@@ -241,6 +241,21 @@ class QwenImmLayerWrapper(nn.Module):
     def set_history_lookup_mask(self, history_lookup_mask: Optional[torch.Tensor]) -> None:
         self.history_lookup_mask = history_lookup_mask
 
+    def __getattr__(self, name: str):
+        """
+        Delegate unknown attributes to the wrapped decoder layer.
+
+        Newer transformers implementations may access layer-specific metadata
+        (e.g. `attention_type`) directly on each decoder block.
+        """
+        try:
+            return super().__getattr__(name)
+        except AttributeError as original_exc:
+            base_layer = self._modules.get("base_layer")
+            if base_layer is not None and hasattr(base_layer, name):
+                return getattr(base_layer, name)
+            raise original_exc
+
     def forward(self, *args, **kwargs):
         # Run original decoder layer first, then inject IMM on hidden states.
         base_output = self.base_layer(*args, **kwargs)
