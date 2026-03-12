@@ -336,6 +336,27 @@ class QwenImmAdapter(nn.Module):
     def forward(self, *args, **kwargs):
         return self.base_model(*args, **kwargs)
 
+    def prepare_inputs_for_generation(self, *args, **kwargs):
+        """
+        Delegate generation input preparation to the wrapped base causal LM.
+
+        PEFT's causal LM wrappers require this method to exist on the incoming
+        model object when building LoRA adapters.
+        """
+        if not hasattr(self.base_model, "prepare_inputs_for_generation"):
+            raise AttributeError("base_model does not provide prepare_inputs_for_generation().")
+        return self.base_model.prepare_inputs_for_generation(*args, **kwargs)
+
+    def _prepare_encoder_decoder_kwargs_for_generation(self, *args, **kwargs):
+        """
+        Keep compatibility with generation internals used by some PEFT paths.
+        """
+        if not hasattr(self.base_model, "_prepare_encoder_decoder_kwargs_for_generation"):
+            raise AttributeError(
+                "base_model does not provide _prepare_encoder_decoder_kwargs_for_generation()."
+            )
+        return self.base_model._prepare_encoder_decoder_kwargs_for_generation(*args, **kwargs)
+
     def generate(self, *args, **kwargs):
         if not hasattr(self.base_model, "generate"):
             raise AttributeError("base_model does not provide generate().")
