@@ -318,6 +318,13 @@ class QwenImmAdapter(nn.Module):
 
         self.selected_layer_indices = tuple(selected_indices)
 
+    @property
+    def config(self):
+        """
+        Expose base model config for PEFT/transformers compatibility.
+        """
+        return self.base_model.config
+
     def set_memory_state(self, memory_state: MultiScopeMemoryState) -> None:
         self.memory_state = memory_state
         for wrapped_layer in self.wrapped_layers:
