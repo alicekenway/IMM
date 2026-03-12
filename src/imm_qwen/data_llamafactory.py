@@ -182,6 +182,8 @@ class ImmDataCollator:
     def __call__(self, features: Sequence[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
         # Base supervised tensors are padded by tokenizer utility.
         base_features: List[Dict[str, torch.Tensor]] = []
+        labels_batch: List[torch.Tensor] = []
+        history_lookup_mask_batch: List[torch.Tensor] = []
         history_line_input_ids_batch: List[List[torch.Tensor]] = []
         history_line_attention_mask_batch: List[List[torch.Tensor]] = []
 
@@ -190,10 +192,10 @@ class ImmDataCollator:
                 {
                     "input_ids": feature["input_ids"],
                     "attention_mask": feature["attention_mask"],
-                    "labels": feature["labels"],
-                    "history_lookup_mask": feature["history_lookup_mask"],
                 }
             )
+            labels_batch.append(feature["labels"])
+            history_lookup_mask_batch.append(feature["history_lookup_mask"])
             history_line_input_ids_batch.append(feature["history_line_input_ids"])
             history_line_attention_mask_batch.append(feature["history_line_attention_mask"])
 
@@ -202,8 +204,29 @@ class ImmDataCollator:
             padding=True,
             return_tensors="pt",
         )
-        if "history_lookup_mask" in batch:
-            batch["history_lookup_mask"] = batch["history_lookup_mask"].to(torch.bool)
+
+        sequence_length = int(batch["input_ids"].size(1))
+        batch_size = len(features)
+
+        labels = torch.full(
+            (batch_size, sequence_length),
+            fill_value=-100,
+            dtype=torch.long,
+        )
+        history_lookup_mask = torch.ones(
+            (batch_size, sequence_length),
+            dtype=torch.bool,
+        )
+        for batch_index, (feature_labels, feature_history_lookup_mask) in enumerate(
+            zip(labels_batch, history_lookup_mask_batch)
+        ):
+            feature_length = int(feature_labels.numel())
+            labels[batch_index, :feature_length] = feature_labels
+            history_lookup_mask[batch_index, :feature_length] = feature_history_lookup_mask.to(
+                torch.bool
+            )
+        batch["labels"] = labels
+        batch["history_lookup_mask"] = history_lookup_mask
 
         # History lines are padded into [B, H, T_hist] to support batched
         # memory prefill without per-sample Python loops in the train step.
@@ -213,7 +236,6 @@ class ImmDataCollator:
             for line_ids in line_list:
                 max_history_length = max(max_history_length, int(line_ids.numel()))
 
-        batch_size = len(features)
         pad_token_id = self.tokenizer.pad_token_id
         if pad_token_id is None:
             pad_token_id = 0
