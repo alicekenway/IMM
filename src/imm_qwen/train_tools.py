@@ -6,7 +6,6 @@ import torch
 from .config import ImmQwenProjectConfig
 from .controller import RuleBasedMemoryController
 from .data_llamafactory import ImmDataCollator
-from .memory_state import MultiScopeMemoryState
 from .modeling_imm import QwenImmAdapter
 
 
@@ -15,7 +14,6 @@ class TrainBuildArtifacts:
     model: torch.nn.Module
     tokenizer: Any
     controller: RuleBasedMemoryController
-    memory_state: MultiScopeMemoryState
     data_collator: ImmDataCollator
 
 
@@ -88,18 +86,11 @@ def build_model_with_imm(project_config: ImmQwenProjectConfig) -> TrainBuildArti
 
     hidden_dim = int(base_model.config.hidden_size)
     controller = RuleBasedMemoryController(project_config.controller)
-    memory_state = MultiScopeMemoryState(
-        key_dim=project_config.memory_dimensions.key_dim,
-        value_dim=project_config.memory_dimensions.value_dim,
-        working_slots=project_config.memory_slots.working_slots,
-        session_slots=project_config.memory_slots.session_slots,
-    )
 
     wrapped_model = QwenImmAdapter(
         base_model=base_model,
         placement_config=project_config.placement,
         controller=controller,
-        memory_state=memory_state,
         hidden_dim=hidden_dim,
         key_dim=project_config.memory_dimensions.key_dim,
         value_dim=project_config.memory_dimensions.value_dim,
@@ -111,14 +102,11 @@ def build_model_with_imm(project_config: ImmQwenProjectConfig) -> TrainBuildArti
         model=wrapped_model,
         tokenizer=tokenizer,
         controller=controller,
-        memory_state=memory_state,
         data_collator=data_collator,
     )
 
 
 def resolve_imm_adapter(model: torch.nn.Module) -> QwenImmAdapter:
-    # Iteratively unwrap common wrapper attributes while guarding against
-    # self-referential links (e.g. base_model property returning self).
     pending_models: List[torch.nn.Module] = [model]
     visited_model_ids = set()
     candidate_attrs = ("module", "base_model", "model")
@@ -150,62 +138,6 @@ def resolve_imm_adapter(model: torch.nn.Module) -> QwenImmAdapter:
             pending_models.append(nested_model)
 
     raise ValueError("Cannot resolve QwenImmAdapter from the provided model.")
-
-
-def prefill_history_memory(
-    model: torch.nn.Module,
-    history_input_ids: torch.Tensor,
-    history_attention_mask: torch.Tensor,
-    history_line_mask: torch.Tensor,
-) -> None:
-    """
-    Prefill session memory from history lines before current-turn supervision.
-
-    Tensor shapes:
-      - history_input_ids: [B, H, T_hist]
-      - history_attention_mask: [B, H, T_hist]
-      - history_line_mask: [B, H]
-    """
-    adapter = resolve_imm_adapter(model)
-    imm_module = adapter.get_last_imm_module()
-    if imm_module is None:
-        return
-
-    batch_size, history_lines_count, _ = history_input_ids.shape
-    if history_lines_count == 0:
-        return
-
-    device = next(model.parameters()).device
-    history_input_ids = history_input_ids.to(device)
-    history_attention_mask = history_attention_mask.to(device)
-    history_line_mask = history_line_mask.to(device)
-
-    for history_line_index in range(history_lines_count):
-        active_rows = history_line_mask[:, history_line_index]
-        if not torch.any(active_rows):
-            continue
-
-        line_input_ids = history_input_ids[:, history_line_index, :]
-        line_attention_mask = history_attention_mask[:, history_line_index, :]
-        # During history prefill we avoid recursive history lookups by masking
-        # all positions from reading existing session memory.
-        line_history_lookup_mask = torch.ones_like(line_attention_mask, dtype=torch.bool)
-        adapter.set_history_lookup_mask(line_history_lookup_mask)
-
-        outputs = model(
-            input_ids=line_input_ids,
-            attention_mask=line_attention_mask,
-            output_hidden_states=True,
-            use_cache=False,
-            return_dict=True,
-        )
-        final_hidden = outputs.hidden_states[-1]
-        imm_module.write_session_summary(
-            hidden_states=final_hidden,
-            memory_state=adapter.memory_state,
-            attention_mask=line_attention_mask,
-            row_mask=active_rows,
-        )
 
 
 def build_optimizer_groups(
@@ -259,4 +191,3 @@ def build_loss_bundle(
             total_loss = total_loss + value
     loss_bundle["total_loss"] = total_loss
     return loss_bundle
-

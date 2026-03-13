@@ -1,19 +1,37 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 
 from .config import InferenceToolConfig
 from .controller import RuleBasedMemoryController
-from .memory_state import MultiScopeMemoryState
 from .modeling_imm import QwenImmAdapter, QwenImmLayerWrapper
+
+
+@dataclass
+class LayerSlotBank:
+    """Persistent per-layer K,V memory bank for inference sessions."""
+    keys: List[torch.Tensor] = field(default_factory=list)
+    values: List[torch.Tensor] = field(default_factory=list)
+
+    @property
+    def num_slots(self) -> int:
+        return len(self.keys)
+
+    def append(self, key: torch.Tensor, value: torch.Tensor) -> None:
+        self.keys.append(key.detach().cpu())
+        self.values.append(value.detach().cpu())
+
+    def clear(self) -> None:
+        self.keys.clear()
+        self.values.clear()
 
 
 @dataclass
 class SessionRecord:
     session_id: str
-    memory_state: MultiScopeMemoryState
+    layer_banks: List[LayerSlotBank] = field(default_factory=list)
     turn_index: int = 0
 
 
@@ -24,19 +42,15 @@ class SessionManager:
     def get_or_create_session(
         self,
         session_id: str,
-        template_memory_state: MultiScopeMemoryState,
+        num_layers: int,
     ) -> SessionRecord:
         if session_id in self._sessions:
             return self._sessions[session_id]
 
-        memory_state = MultiScopeMemoryState(
-            key_dim=template_memory_state.key_dim,
-            value_dim=template_memory_state.value_dim,
-            working_slots=template_memory_state.working_slots,
-            session_slots=template_memory_state.session_slots,
-            replacement_policy=template_memory_state.replacement_policy,
+        record = SessionRecord(
+            session_id=session_id,
+            layer_banks=[LayerSlotBank() for _ in range(num_layers)],
         )
-        record = SessionRecord(session_id=session_id, memory_state=memory_state)
         self._sessions[session_id] = record
         return record
 
@@ -45,23 +59,31 @@ class SessionManager:
         payload = {
             "session_id": record.session_id,
             "turn_index": record.turn_index,
-            "memory_state": record.memory_state.get_state_dict(),
+            "num_layers": len(record.layer_banks),
+            "layer_banks": [
+                {
+                    "keys": [k.clone() for k in bank.keys],
+                    "values": [v.clone() for v in bank.values],
+                }
+                for bank in record.layer_banks
+            ],
         }
         torch.save(payload, file_path)
 
     def load_session(self, file_path: str) -> SessionRecord:
         payload = torch.load(file_path, map_location="cpu")
         session_id = str(payload["session_id"])
-        memory_state = MultiScopeMemoryState(
-            key_dim=int(payload["memory_state"]["key_dim"]),
-            value_dim=int(payload["memory_state"]["value_dim"]),
-            working_slots=int(payload["memory_state"]["working_slots"]),
-            session_slots=int(payload["memory_state"]["session_slots"]),
-        )
-        memory_state.load_state_dict(payload["memory_state"])
+        num_layers = int(payload["num_layers"])
+        layer_banks = []
+        for bank_data in payload["layer_banks"]:
+            bank = LayerSlotBank(
+                keys=bank_data["keys"],
+                values=bank_data["values"],
+            )
+            layer_banks.append(bank)
         record = SessionRecord(
             session_id=session_id,
-            memory_state=memory_state,
+            layer_banks=layer_banks,
             turn_index=int(payload["turn_index"]),
         )
         self._sessions[session_id] = record
@@ -72,16 +94,17 @@ class InferenceEngine:
     def __init__(
         self,
         model: torch.nn.Module,
-        tokenizer,
+        tokenizer: Any,
         controller: RuleBasedMemoryController,
-        template_memory_state: MultiScopeMemoryState,
         options: Optional[InferenceToolConfig] = None,
     ) -> None:
         self.model = model
         self.tokenizer = tokenizer
         self.controller = controller
-        self.template_memory_state = template_memory_state
         self.options = options or InferenceToolConfig()
+
+        adapter = self._resolve_adapter(self.model)
+        self.num_imm_layers = len(adapter.wrapped_layers)
         self.session_manager = SessionManager()
 
     def generate_response(
@@ -93,22 +116,21 @@ class InferenceEngine:
     ) -> str:
         record = self.session_manager.get_or_create_session(
             session_id=session_id,
-            template_memory_state=self.template_memory_state,
+            num_layers=self.num_imm_layers,
         )
         adapter = self._resolve_adapter(self.model)
-        adapter.set_memory_state(record.memory_state)
+        device = next(self.model.parameters()).device
 
-        if self.options.reset_working_memory_per_turn:
-            record.memory_state.reset_working()
+        # Load persistent session memory into the wrapper layer buffers.
+        self._load_session_memory_to_wrappers(adapter, record, device)
 
         prompt_text = self._build_prompt(user_text)
         model_inputs = self.tokenizer(prompt_text, return_tensors="pt")
-        input_ids = model_inputs["input_ids"].to(next(self.model.parameters()).device)
-        attention_mask = model_inputs["attention_mask"].to(input_ids.device)
+        input_ids = model_inputs["input_ids"].to(device)
+        attention_mask = model_inputs["attention_mask"].to(device)
 
-        # In online generation we do not have supervised labels, so we keep
-        # history lookup mask unset here. Training provides explicit masks.
-        adapter.set_history_lookup_mask(None)
+        # Query existing memory during generation.
+        adapter.set_present_query_mode(history_lookup_mask=None)
 
         with torch.no_grad():
             generated = self.model.generate(
@@ -120,41 +142,76 @@ class InferenceEngine:
             )
 
         generated_text = self.tokenizer.decode(generated[0], skip_special_tokens=True)
-        response_text = generated_text[len(prompt_text) :].strip()
+        response_text = generated_text[len(prompt_text):].strip()
 
-        self._write_turn_summary(record, input_ids, attention_mask)
+        # Write the completed turn into per-layer memory.
+        self._write_turn_to_session(adapter, record, input_ids, attention_mask, device)
         record.turn_index += 1
+
+        adapter.set_passthrough_mode()
         return response_text
 
     def _build_prompt(self, user_text: str) -> str:
         return f"User: {user_text}\nAssistant:"
 
-    def _write_turn_summary(
+    def _load_session_memory_to_wrappers(
         self,
+        adapter: QwenImmAdapter,
+        record: SessionRecord,
+        device: torch.device,
+    ) -> None:
+        """Populate each wrapper's K,V buffers from the persistent session banks."""
+        for wrapper, bank in zip(adapter.wrapped_layers, record.layer_banks):
+            wrapper.clear_memory_slots()
+            for key, value in zip(bank.keys, bank.values):
+                wrapper.append_memory_slot(
+                    key=key.to(device),
+                    value=value.to(device),
+                )
+
+    def _write_turn_to_session(
+        self,
+        adapter: QwenImmAdapter,
         record: SessionRecord,
         input_ids: torch.Tensor,
         attention_mask: torch.Tensor,
+        device: torch.device,
     ) -> None:
-        adapter = self._resolve_adapter(self.model)
-        wrapped_layers = adapter.wrapped_layers
-        if not wrapped_layers:
-            return
+        """Run the completed turn through the backbone in history_collect mode
+        to produce K,V for each IMM layer, then persist them."""
+        # Temporarily clear and use collect mode to capture this turn's K,V.
+        # Save existing slots first.
+        saved_keys = [list(w._collected_keys) for w in adapter.wrapped_layers]
+        saved_values = [list(w._collected_values) for w in adapter.wrapped_layers]
+        saved_valid = [list(w._collected_valid) for w in adapter.wrapped_layers]
+
+        for wrapper in adapter.wrapped_layers:
+            wrapper.clear_memory_slots()
+
+        adapter.set_history_collect_mode(attention_mask=attention_mask)
 
         with torch.no_grad():
-            outputs = self.model(
+            self.model(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
-                output_hidden_states=True,
                 use_cache=False,
             )
-            final_hidden = outputs.hidden_states[-1]
-            wrapped_layers[-1].imm_module.write_session_summary(
-                hidden_states=final_hidden,
-                memory_state=record.memory_state,
-                attention_mask=attention_mask,
-                turn_index=record.turn_index,
-                retention_score=1.0,
-            )
+
+        # Extract the newly collected K,V and persist to session banks.
+        for wrapper, bank in zip(adapter.wrapped_layers, record.layer_banks):
+            if wrapper._collected_keys:
+                bank.append(
+                    key=wrapper._collected_keys[0],
+                    value=wrapper._collected_values[0],
+                )
+
+        # Restore the previous slots.
+        for wrapper, keys, values, valid in zip(
+            adapter.wrapped_layers, saved_keys, saved_values, saved_valid
+        ):
+            wrapper._collected_keys = keys
+            wrapper._collected_values = values
+            wrapper._collected_valid = valid
 
     @staticmethod
     def _resolve_adapter(model: torch.nn.Module) -> QwenImmAdapter:
@@ -167,4 +224,3 @@ class InferenceEngine:
             if hasattr(base_model, "model") and isinstance(base_model.model, QwenImmAdapter):
                 return base_model.model
         raise ValueError("Cannot resolve QwenImmAdapter from model wrapper stack.")
-

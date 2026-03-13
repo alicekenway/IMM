@@ -37,7 +37,6 @@ def main() -> None:
         model=artifacts.model,
         tokenizer=artifacts.tokenizer,
         controller=artifacts.controller,
-        template_memory_state=artifacts.memory_state,
         options=options,
     )
     response = engine.generate_response(
@@ -50,4 +49,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

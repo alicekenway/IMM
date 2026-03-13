@@ -26,7 +26,6 @@ from .train_tools import (
     build_loss_bundle,
     build_model_with_imm,
     build_optimizer_groups,
-    prefill_history_memory,
     resolve_imm_adapter,
 )
 
@@ -97,16 +96,70 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _dual_stream_forward(model, adapter, batch):
+    """Run dual-stream forward: history collect then present query.
+
+    1. Clear per-layer memory slots.
+    2. For each history turn, run the backbone under no_grad while
+       the IMM wrappers re-enable grad for compress/write projections.
+    3. Switch wrappers to present_query mode and run the present turn.
+    """
+    adapter.clear_all_memory_slots()
+
+    history_input_ids = batch["history_input_ids"]
+    history_attention_mask = batch["history_attention_mask"]
+    history_line_mask = batch["history_line_mask"]
+
+    batch_size, num_history_lines, _ = history_input_ids.shape
+
+    # --- history stream (backbone under no_grad, write projections with grad) ---
+    with torch.no_grad():
+        for h_idx in range(num_history_lines):
+            active = history_line_mask[:, h_idx]
+            if not active.any():
+                continue
+
+            line_ids = history_input_ids[:, h_idx, :]
+            line_mask = history_attention_mask[:, h_idx, :]
+
+            adapter.set_history_collect_mode(
+                attention_mask=line_mask,
+                row_mask=active,
+            )
+
+            model(
+                input_ids=line_ids,
+                attention_mask=line_mask,
+                use_cache=False,
+            )
+
+    # --- present stream (full grad, queries accumulated K,V) ---
+    adapter.set_present_query_mode(
+        history_lookup_mask=batch["history_lookup_mask"],
+    )
+
+    outputs = model(
+        input_ids=batch["input_ids"],
+        attention_mask=batch["attention_mask"],
+        use_cache=False,
+        return_dict=True,
+    )
+
+    adapter.set_passthrough_mode()
+    return outputs
+
+
 def main() -> None:
     args = build_parser().parse_args()
     payload = _load_yaml(args.config)
     project_config, data_config, training_config = _build_project_config(payload)
     _set_seed(training_config.seed)
 
-    # IMM write parameters (summary_compressor, write_key_proj, write_value_proj)
-    # are only used under torch.no_grad() during history prefill, so they never
-    # receive gradients in the backward pass.  DDP would hang waiting for their
-    # gradient all-reduce buckets without find_unused_parameters=True.
+    # IMM write projections now participate in the computation graph via
+    # torch.enable_grad() inside the layer wrappers, so they receive
+    # gradients through the present-turn loss. find_unused_parameters is
+    # still needed because the summary_compressor and write projections
+    # are not called during the DDP-tracked present forward pass.
     ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
     accelerator = Accelerator(
         gradient_accumulation_steps=training_config.grad_accum_steps,
@@ -146,33 +199,9 @@ def main() -> None:
         for batch_index, batch in enumerate(train_dataloader):
             global_step += 1
             adapter = resolve_imm_adapter(model)
-            # Efficiency mode: keep only turn-level session memory.
-            # Working memory is reset every batch/turn.
-            adapter.reset_session_memory()
-            adapter.reset_working_memory()
-
-            # 1) History lines are embedded into session memory first.
-            with torch.no_grad():
-                prefill_history_memory(
-                    model=model,
-                    history_input_ids=batch["history_input_ids"],
-                    history_attention_mask=batch["history_attention_mask"],
-                    history_line_mask=batch["history_line_mask"],
-                )
-
-            # 2) Present turn predicts output by querying session memory.
-            # Mask convention:
-            #   True  -> masked (do not read history at this token)
-            #   False -> unmasked (allow history read at this token)
-            adapter.set_history_lookup_mask(batch["history_lookup_mask"])
 
             with accelerator.accumulate(model):
-                outputs = model(
-                    input_ids=batch["input_ids"],
-                    attention_mask=batch["attention_mask"],
-                    use_cache=False,
-                    return_dict=True,
-                )
+                outputs = _dual_stream_forward(model, adapter, batch)
                 loss_bundle = build_loss_bundle(logits=outputs.logits, labels=batch["labels"])
                 total_loss = loss_bundle["total_loss"]
 

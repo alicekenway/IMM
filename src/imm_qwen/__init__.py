@@ -22,7 +22,6 @@ from .train_tools import (
     build_model_with_imm,
     build_optimizer_groups,
     build_tokenizer,
-    prefill_history_memory,
     resolve_imm_adapter,
 )
 
@@ -52,7 +51,5 @@ __all__ = [
     "build_model_with_imm",
     "build_optimizer_groups",
     "build_tokenizer",
-    "prefill_history_memory",
     "resolve_imm_adapter",
 ]
-
