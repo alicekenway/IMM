@@ -5,6 +5,8 @@ from pathlib import Path
 from typing import Any, Dict, Tuple
 
 import torch
+from accelerate import Accelerator
+from accelerate.utils import DistributedDataParallelKwargs
 from torch.utils.data import DataLoader
 
 from .config import (
@@ -101,6 +103,16 @@ def main() -> None:
     project_config, data_config, training_config = _build_project_config(payload)
     _set_seed(training_config.seed)
 
+    # IMM write parameters (summary_compressor, write_key_proj, write_value_proj)
+    # are only used under torch.no_grad() during history prefill, so they never
+    # receive gradients in the backward pass.  DDP would hang waiting for their
+    # gradient all-reduce buckets without find_unused_parameters=True.
+    ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
+    accelerator = Accelerator(
+        gradient_accumulation_steps=training_config.grad_accum_steps,
+        kwargs_handlers=[ddp_kwargs],
+    )
+
     artifacts = build_model_with_imm(project_config)
 
     dataset = ImmSupervisedDataset(
@@ -122,29 +134,12 @@ def main() -> None:
     )
     optimizer = torch.optim.AdamW(optimizer_groups)
 
-    accelerator = None
-    if training_config.use_accelerate:
-        try:
-            from accelerate import Accelerator
-
-            mixed_precision = training_config.mixed_precision or "no"
-            accelerator = Accelerator(mixed_precision=mixed_precision)
-            model, optimizer, train_dataloader = accelerator.prepare(
-                artifacts.model, optimizer, train_dataloader
-            )
-        except ImportError as exc:
-            raise ImportError(
-                "accelerate is required when training.use_accelerate=true. "
-                "Install with `pip install accelerate`."
-            ) from exc
-    else:
-        model = artifacts.model
-        if torch.cuda.is_available():
-            model = model.cuda()
+    model, optimizer, train_dataloader = accelerator.prepare(
+        artifacts.model, optimizer, train_dataloader
+    )
 
     model.train()
     global_step = 0
-    optimizer.zero_grad(set_to_none=True)
 
     for epoch_index in range(training_config.num_epochs):
         epoch_start = time.time()
@@ -155,13 +150,6 @@ def main() -> None:
             # Working memory is reset every batch/turn.
             adapter.reset_session_memory()
             adapter.reset_working_memory()
-
-            if accelerator is None:
-                device = next(model.parameters()).device
-                batch = {
-                    key: value.to(device) if isinstance(value, torch.Tensor) else value
-                    for key, value in batch.items()
-                }
 
             # 1) History lines are embedded into session memory first.
             with torch.no_grad():
@@ -177,56 +165,50 @@ def main() -> None:
             #   True  -> masked (do not read history at this token)
             #   False -> unmasked (allow history read at this token)
             adapter.set_history_lookup_mask(batch["history_lookup_mask"])
-            outputs = model(
-                input_ids=batch["input_ids"],
-                attention_mask=batch["attention_mask"],
-                use_cache=False,
-                return_dict=True,
-            )
-            loss_bundle = build_loss_bundle(logits=outputs.logits, labels=batch["labels"])
-            total_loss = loss_bundle["total_loss"] / float(training_config.grad_accum_steps)
 
-            if accelerator is not None:
+            with accelerator.accumulate(model):
+                outputs = model(
+                    input_ids=batch["input_ids"],
+                    attention_mask=batch["attention_mask"],
+                    use_cache=False,
+                    return_dict=True,
+                )
+                loss_bundle = build_loss_bundle(logits=outputs.logits, labels=batch["labels"])
+                total_loss = loss_bundle["total_loss"]
+
                 accelerator.backward(total_loss)
-            else:
-                total_loss.backward()
 
-            should_step = (global_step % training_config.grad_accum_steps) == 0
-            if should_step:
-                # Keep gradients stable since IMM + LoRA introduces new paths.
-                if accelerator is not None:
+                if accelerator.sync_gradients:
                     accelerator.clip_grad_norm_(model.parameters(), training_config.max_grad_norm)
-                else:
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), training_config.max_grad_norm)
                 optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
 
             if global_step % training_config.log_every_steps == 0:
                 loss_value = float(loss_bundle["total_loss"].detach().item())
-                print(
+                accelerator.print(
                     f"epoch={epoch_index} step={global_step} "
                     f"loss={loss_value:.6f} batch={batch_index}"
                 )
 
         elapsed = time.time() - epoch_start
-        print(f"epoch={epoch_index} completed in {elapsed:.2f}s")
+        accelerator.print(f"epoch={epoch_index} completed in {elapsed:.2f}s")
+
+    accelerator.wait_for_everyone()
 
     output_dir = Path(training_config.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-    artifacts.tokenizer.save_pretrained(output_dir.as_posix())
-    unwrapped_model = model
-    if accelerator is not None:
-        unwrapped_model = accelerator.unwrap_model(model)
-    if hasattr(unwrapped_model, "save_pretrained"):
-        unwrapped_model.save_pretrained(output_dir.as_posix())
+    unwrapped_model = accelerator.unwrap_model(model)
+    if accelerator.is_main_process:
+        artifacts.tokenizer.save_pretrained(output_dir.as_posix())
+        if hasattr(unwrapped_model, "save_pretrained"):
+            unwrapped_model.save_pretrained(output_dir.as_posix())
 
-    print("IMM-Qwen training completed.")
-    print(f"dataset_size={len(dataset)}")
-    print(f"optimizer_groups={len(optimizer_groups)} output_dir={output_dir.as_posix()}")
+    accelerator.print("IMM-Qwen training completed.")
+    accelerator.print(f"dataset_size={len(dataset)}")
+    accelerator.print(f"optimizer_groups={len(optimizer_groups)} output_dir={output_dir.as_posix()}")
     final_adapter = resolve_imm_adapter(model)
-    print(f"selected_layers={getattr(final_adapter, 'selected_layer_indices', None)}")
+    accelerator.print(f"selected_layers={getattr(final_adapter, 'selected_layer_indices', None)}")
 
 
 if __name__ == "__main__":
     main()
-

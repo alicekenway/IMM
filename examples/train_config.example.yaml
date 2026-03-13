@@ -87,10 +87,6 @@ data:
   derive_history_lookup_mask_from_labels: true
 
 training:
-  # Use Hugging Face Accelerate to prepare the model, optimizer, and dataloader.
-  use_accelerate: true
-  # Mixed precision mode passed to Accelerate. Common values: bf16, fp16, no.
-  mixed_precision: "bf16"
   # Learning rate for LoRA parameters.
   learning_rate_lora: 2.0e-4
   # Learning rate for IMM and other non-LoRA trainable parameters.

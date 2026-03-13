@@ -87,8 +87,6 @@ class ModelBuildConfig:
 
 @dataclass(frozen=True)
 class TrainingToolConfig:
-    use_accelerate: bool = True
-    mixed_precision: Optional[str] = "bf16"
     learning_rate_lora: float = 2e-4
     learning_rate_imm: float = 2e-4
     weight_decay: float = 0.01
