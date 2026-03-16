@@ -79,6 +79,14 @@ def attach_lora_to_qwen(model: torch.nn.Module, project_config: ImmQwenProjectCo
     return get_peft_model(model, lora_config)
 
 
+def mark_imm_parameters_trainable(model: torch.nn.Module) -> None:
+    # PEFT LoRA freezes non-adapter parameters by default, but IMM modules
+    # are part of the trainable path and must remain learnable.
+    for name, parameter in model.named_parameters():
+        if "imm_module" in name:
+            parameter.requires_grad = True
+
+
 def build_model_with_imm(project_config: ImmQwenProjectConfig) -> TrainBuildArtifacts:
     tokenizer = build_tokenizer(project_config)
     base_model = build_base_causal_lm_model(project_config)
@@ -97,6 +105,7 @@ def build_model_with_imm(project_config: ImmQwenProjectConfig) -> TrainBuildArti
         summary_config=project_config.turn_summary,
     )
     wrapped_model = attach_lora_to_qwen(wrapped_model, project_config)
+    mark_imm_parameters_trainable(wrapped_model)
     data_collator = ImmDataCollator(tokenizer)
     return TrainBuildArtifacts(
         model=wrapped_model,
