@@ -95,6 +95,9 @@ training:
   weight_decay: 0.01
   # Per-step micro-batch size before gradient accumulation.
   batch_size: 4
+  # Number of worker processes for dataset tokenization/collation.
+  # Increase this when first-batch loading is slow.
+  num_workers: 0
   # Number of full passes over the dataset.
   num_epochs: 3
   # Number of steps to accumulate gradients before each optimizer update.
@@ -110,4 +113,3 @@ training:
   output_dir: "outputs/imm_qwen"
   # Random seed for reproducible data order and initialization behavior.
   seed: 42
-

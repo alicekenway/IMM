@@ -131,6 +131,8 @@ def main() -> None:
         dataset,
         batch_size=training_config.batch_size,
         shuffle=True,
+        num_workers=training_config.num_workers,
+        persistent_workers=training_config.num_workers > 0,
         collate_fn=artifacts.data_collator,
     )
 
@@ -148,13 +150,29 @@ def main() -> None:
 
     model.train()
     global_step = 0
+    accelerator.print(
+        f"dataset_size={len(dataset)} "
+        f"batches_per_epoch={len(train_dataloader)} "
+        f"batch_size={training_config.batch_size} "
+        f"num_workers={training_config.num_workers} "
+        f"grad_accum_steps={training_config.grad_accum_steps}"
+    )
 
     for epoch_index in range(training_config.num_epochs):
         epoch_start = time.time()
         for batch_index, batch in enumerate(train_dataloader):
             global_step += 1
+            batch_fetch_elapsed = time.time() - epoch_start
+            if batch_index == 0:
+                accelerator.print(
+                    f"epoch={epoch_index} batch={batch_index} "
+                    f"batch_fetched_after={batch_fetch_elapsed:.2f}s "
+                    f"input_shape={tuple(batch['input_ids'].shape)} "
+                    f"history_shape={tuple(batch['history_input_ids'].shape)}"
+                )
 
             with accelerator.accumulate(model):
+                forward_start = time.time()
                 # Single forward call: the model dispatches to
                 # dual_stream_forward when history_input_ids is present.
                 outputs = model(
@@ -167,12 +185,15 @@ def main() -> None:
                     use_cache=False,
                     return_dict=True,
                 )
+                forward_elapsed = time.time() - forward_start
                 loss_bundle = build_loss_bundle(
                     logits=outputs.logits, labels=batch["labels"]
                 )
                 total_loss = loss_bundle["total_loss"]
 
+                backward_start = time.time()
                 accelerator.backward(total_loss)
+                backward_elapsed = time.time() - backward_start
 
                 if accelerator.sync_gradients:
                     accelerator.clip_grad_norm_(
@@ -180,6 +201,15 @@ def main() -> None:
                     )
                 optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
+                step_elapsed = time.time() - forward_start
+
+            if batch_index == 0:
+                accelerator.print(
+                    f"epoch={epoch_index} batch={batch_index} "
+                    f"forward_time={forward_elapsed:.2f}s "
+                    f"backward_time={backward_elapsed:.2f}s "
+                    f"step_time={step_elapsed:.2f}s"
+                )
 
             if global_step % training_config.log_every_steps == 0:
                 loss_value = float(loss_bundle["total_loss"].detach().item())

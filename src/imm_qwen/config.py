@@ -91,6 +91,7 @@ class TrainingToolConfig:
     learning_rate_imm: float = 2e-4
     weight_decay: float = 0.01
     batch_size: int = 4
+    num_workers: int = 0
     num_epochs: int = 1
     grad_accum_steps: int = 1
     max_grad_norm: float = 1.0
@@ -118,4 +119,3 @@ class ImmQwenProjectConfig:
     placement: ImmPlacementConfig = field(default_factory=ImmPlacementConfig)
     replacement_policy: ReplacementPolicyConfig = field(default_factory=ReplacementPolicyConfig)
     lora: LoraConfigSpec = field(default_factory=LoraConfigSpec)
-
