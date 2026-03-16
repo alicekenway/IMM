@@ -43,12 +43,15 @@ def _filter_known_fields(config_cls, payload: Dict[str, Any]) -> Dict[str, Any]:
     return {key: value for key, value in payload.items() if key in valid_keys}
 
 
-def _build_project_config(payload: Dict[str, Any]) -> Tuple[ImmQwenProjectConfig, DataSchemaConfig, TrainingToolConfig]:
-    model_config = ModelBuildConfig(**_filter_known_fields(ModelBuildConfig, payload["model"]))
+def _build_project_config(
+    payload: Dict[str, Any],
+) -> Tuple[ImmQwenProjectConfig, DataSchemaConfig, TrainingToolConfig]:
+    model_config = ModelBuildConfig(
+        **_filter_known_fields(ModelBuildConfig, payload["model"])
+    )
     memory_dimensions = MemoryDimensionsConfig(
         **_filter_known_fields(MemoryDimensionsConfig, payload["memory_dimensions"])
     )
-
     memory_slots = MemorySlotsConfig(
         **_filter_known_fields(MemorySlotsConfig, payload.get("memory_slots", {}))
     )
@@ -61,16 +64,20 @@ def _build_project_config(payload: Dict[str, Any]) -> Tuple[ImmQwenProjectConfig
     placement = ImmPlacementConfig(
         **_filter_known_fields(ImmPlacementConfig, payload.get("placement", {}))
     )
-    lora = LoraConfigSpec(**_filter_known_fields(LoraConfigSpec, payload.get("lora", {})))
+    lora = LoraConfigSpec(
+        **_filter_known_fields(LoraConfigSpec, payload.get("lora", {}))
+    )
 
     data_payload = payload.get("data", {})
     if "dataset_path" not in data_payload:
         raise ValueError("config.data.dataset_path is required.")
-    data_config = DataSchemaConfig(**_filter_known_fields(DataSchemaConfig, data_payload))
-
+    data_config = DataSchemaConfig(
+        **_filter_known_fields(DataSchemaConfig, data_payload)
+    )
     training_config = TrainingToolConfig(
         **_filter_known_fields(TrainingToolConfig, payload.get("training", {}))
     )
+
     project_config = ImmQwenProjectConfig(
         model=model_config,
         memory_dimensions=memory_dimensions,
@@ -91,62 +98,13 @@ def _set_seed(seed: int) -> None:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Train IMM-Qwen with YAML hyperparameters.")
-    parser.add_argument("--config", type=str, required=True, help="Path to training config YAML.")
+    parser = argparse.ArgumentParser(
+        description="Train IMM-Qwen with YAML hyperparameters."
+    )
+    parser.add_argument(
+        "--config", type=str, required=True, help="Path to training config YAML."
+    )
     return parser
-
-
-def _dual_stream_forward(model, adapter, batch):
-    """Run dual-stream forward: history collect then present query.
-
-    1. Clear per-layer memory slots.
-    2. For each history turn, run the backbone under no_grad while
-       the IMM wrappers re-enable grad for compress/write projections.
-    3. Switch wrappers to present_query mode and run the present turn.
-    """
-    adapter.clear_all_memory_slots()
-
-    history_input_ids = batch["history_input_ids"]
-    history_attention_mask = batch["history_attention_mask"]
-    history_line_mask = batch["history_line_mask"]
-
-    batch_size, num_history_lines, _ = history_input_ids.shape
-
-    # --- history stream (backbone under no_grad, write projections with grad) ---
-    with torch.no_grad():
-        for h_idx in range(num_history_lines):
-            active = history_line_mask[:, h_idx]
-            if not active.any():
-                continue
-
-            line_ids = history_input_ids[:, h_idx, :]
-            line_mask = history_attention_mask[:, h_idx, :]
-
-            adapter.set_history_collect_mode(
-                attention_mask=line_mask,
-                row_mask=active,
-            )
-
-            model(
-                input_ids=line_ids,
-                attention_mask=line_mask,
-                use_cache=False,
-            )
-
-    # --- present stream (full grad, queries accumulated K,V) ---
-    adapter.set_present_query_mode(
-        history_lookup_mask=batch["history_lookup_mask"],
-    )
-
-    outputs = model(
-        input_ids=batch["input_ids"],
-        attention_mask=batch["attention_mask"],
-        use_cache=False,
-        return_dict=True,
-    )
-
-    adapter.set_passthrough_mode()
-    return outputs
 
 
 def main() -> None:
@@ -155,12 +113,9 @@ def main() -> None:
     project_config, data_config, training_config = _build_project_config(payload)
     _set_seed(training_config.seed)
 
-    # IMM write projections now participate in the computation graph via
-    # torch.enable_grad() inside the layer wrappers, so they receive
-    # gradients through the present-turn loss. find_unused_parameters is
-    # still needed because the summary_compressor and write projections
-    # are not called during the DDP-tracked present forward pass.
-    ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
+    # All IMM parameters are used inside dual_stream_forward (called from
+    # the DDP-tracked forward), so find_unused_parameters is not needed.
+    ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=False)
     accelerator = Accelerator(
         gradient_accumulation_steps=training_config.grad_accum_steps,
         kwargs_handlers=[ddp_kwargs],
@@ -198,17 +153,31 @@ def main() -> None:
         epoch_start = time.time()
         for batch_index, batch in enumerate(train_dataloader):
             global_step += 1
-            adapter = resolve_imm_adapter(model)
 
             with accelerator.accumulate(model):
-                outputs = _dual_stream_forward(model, adapter, batch)
-                loss_bundle = build_loss_bundle(logits=outputs.logits, labels=batch["labels"])
+                # Single forward call: the model dispatches to
+                # dual_stream_forward when history_input_ids is present.
+                outputs = model(
+                    input_ids=batch["input_ids"],
+                    attention_mask=batch["attention_mask"],
+                    history_input_ids=batch["history_input_ids"],
+                    history_attention_mask=batch["history_attention_mask"],
+                    history_line_mask=batch["history_line_mask"],
+                    history_lookup_mask=batch["history_lookup_mask"],
+                    use_cache=False,
+                    return_dict=True,
+                )
+                loss_bundle = build_loss_bundle(
+                    logits=outputs.logits, labels=batch["labels"]
+                )
                 total_loss = loss_bundle["total_loss"]
 
                 accelerator.backward(total_loss)
 
                 if accelerator.sync_gradients:
-                    accelerator.clip_grad_norm_(model.parameters(), training_config.max_grad_norm)
+                    accelerator.clip_grad_norm_(
+                        model.parameters(), training_config.max_grad_norm
+                    )
                 optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
 
@@ -234,9 +203,14 @@ def main() -> None:
 
     accelerator.print("IMM-Qwen training completed.")
     accelerator.print(f"dataset_size={len(dataset)}")
-    accelerator.print(f"optimizer_groups={len(optimizer_groups)} output_dir={output_dir.as_posix()}")
+    accelerator.print(
+        f"optimizer_groups={len(optimizer_groups)} "
+        f"output_dir={output_dir.as_posix()}"
+    )
     final_adapter = resolve_imm_adapter(model)
-    accelerator.print(f"selected_layers={getattr(final_adapter, 'selected_layer_indices', None)}")
+    accelerator.print(
+        f"selected_layers={getattr(final_adapter, 'selected_layer_indices', None)}"
+    )
 
 
 if __name__ == "__main__":
