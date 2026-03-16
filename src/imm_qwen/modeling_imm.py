@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 from dataclasses import dataclass
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
@@ -8,6 +9,13 @@ import torch.nn as nn
 
 from .config import ImmPlacementConfig, TurnSummaryConfig
 from .controller import RuleBasedMemoryController
+
+
+def _call_mask_factory(factory, **kwargs):
+    """Adapt to transformers masking helpers whose kwargs vary by version."""
+    supported = inspect.signature(factory).parameters
+    filtered_kwargs = {key: value for key, value in kwargs.items() if key in supported}
+    return factory(**filtered_kwargs)
 
 
 # ---------------------------------------------------------------------------
@@ -464,13 +472,21 @@ class QwenImmAdapter(nn.Module):
             attention_mask=present_attention_mask, cache_position=pres_cache_pos,
             past_key_values=None, position_ids=pres_pos_ids,
         )
-        hist_masks = {"full_attention": create_causal_mask(**_mask_kw_hist)}
-        pres_masks = {"full_attention": create_causal_mask(**_mask_kw_pres)}
+        hist_masks = {
+            "full_attention": _call_mask_factory(create_causal_mask, **_mask_kw_hist)
+        }
+        pres_masks = {
+            "full_attention": _call_mask_factory(create_causal_mask, **_mask_kw_pres)
+        }
 
         if getattr(qwen, "has_sliding_layers", False):
             from transformers.masking_utils import create_sliding_window_causal_mask
-            hist_masks["sliding_attention"] = create_sliding_window_causal_mask(**_mask_kw_hist)
-            pres_masks["sliding_attention"] = create_sliding_window_causal_mask(**_mask_kw_pres)
+            hist_masks["sliding_attention"] = _call_mask_factory(
+                create_sliding_window_causal_mask, **_mask_kw_hist
+            )
+            pres_masks["sliding_attention"] = _call_mask_factory(
+                create_sliding_window_causal_mask, **_mask_kw_pres
+            )
 
         # --- shared layer kwargs (no cache) ----------------------------------
         def _layer_kw(mask_dict, mask_key, pos_ids, pos_emb, cache_pos):
