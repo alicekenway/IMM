@@ -14,6 +14,8 @@ from .controller import RuleBasedMemoryController
 def _call_mask_factory(factory, **kwargs):
     """Adapt to transformers masking helpers whose kwargs vary by version."""
     supported = inspect.signature(factory).parameters
+    if "input_embeds" in supported and "input_embeds" not in kwargs and "inputs_embeds" in kwargs:
+        kwargs["input_embeds"] = kwargs["inputs_embeds"]
     filtered_kwargs = {key: value for key, value in kwargs.items() if key in supported}
     return factory(**filtered_kwargs)
 
