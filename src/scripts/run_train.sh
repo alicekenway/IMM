@@ -61,9 +61,38 @@ if [[ -n "$CONDA_ENV" ]]; then
     echo "Error: Conda environment not found at: $CONDA_ENV"
     exit 1
   fi
-  source "$(conda info --base)/etc/profile.d/conda.sh"
-  conda activate "$CONDA_ENV"
-  echo "✓ Activated conda environment"
+  # Slurm non-interactive shells often do not preload `conda`.
+  # Some conda activate hooks reference unset variables, so temporarily relax `set -u`.
+  _was_nounset=0
+  if [[ "$-" == *u* ]]; then
+    _was_nounset=1
+    set +u
+  fi
+
+  if command -v conda >/dev/null 2>&1; then
+    source "$(conda info --base)/etc/profile.d/conda.sh"
+    conda activate "$CONDA_ENV"
+  else
+    CONDA_ROOT="$(cd "$(dirname "$CONDA_ENV")/.." && pwd)"
+    CONDA_SH="${CONDA_ROOT}/etc/profile.d/conda.sh"
+    if [[ -f "$CONDA_SH" ]]; then
+      source "$CONDA_SH"
+      conda activate "$CONDA_ENV"
+    elif [[ -f "${CONDA_ENV}/bin/activate" ]]; then
+      # Fallback for environments without a full conda initialization setup.
+      source "${CONDA_ENV}/bin/activate"
+    else
+      echo "Error: could not initialize conda from: $CONDA_ENV"
+      echo "Expected one of:"
+      echo "  - $CONDA_SH"
+      echo "  - ${CONDA_ENV}/bin/activate"
+      exit 1
+    fi
+  fi
+  if [[ $_was_nounset -eq 1 ]]; then
+    set -u
+  fi
+  echo "Activated conda environment"
 fi
 
 # Use specified Python or default to current
@@ -114,5 +143,4 @@ echo "Accelerate config: $ACCELERATE_CONFIG"
 # Run training
 echo "Starting training..."
 accelerate launch --config_file "${ACCELERATE_CONFIG}" \
-  --python_version "$($PYTHON_CMD --version | awk '{print $2}')" \
-  "$PYTHON_CMD" -m imm_qwen.train --config "${TRAIN_CONFIG}"
+  -m imm_qwen.train --config "${TRAIN_CONFIG}"

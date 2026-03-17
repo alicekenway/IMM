@@ -99,6 +99,7 @@ class TrainingToolConfig:
     save_every_steps: int = 0
     output_dir: str = "outputs/imm_qwen"
     seed: int = 42
+    resume_from_checkpoint: Optional[str] = None
 
 
 @dataclass(frozen=True)

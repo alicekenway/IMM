@@ -74,8 +74,10 @@ def build_present_turn_prompt_text(record: SupervisedRecord) -> str:
     present_turn = record.input.strip()
     parts.append(f"Input:\n{present_turn}\n")
 
-    parts.append("Assistant:")
-    return "\n".join(parts).strip()
+    # Keep the assistant prefix in the prompt span so response tokenization
+    # does not depend on an injected leading space.
+    parts.append("Assistant:\n")
+    return "\n".join(parts)
 
 
 class ImmSupervisedDataset(Dataset):
@@ -117,29 +119,37 @@ class ImmSupervisedDataset(Dataset):
         if self.data_config.append_eos_token and self.tokenizer.eos_token is not None:
             output_text = output_text + self.tokenizer.eos_token
 
-        full_text = f"{prompt_text} {output_text}".strip()
-
-        prompt_encoding = self.tokenizer(
-            prompt_text,
-            truncation=True,
-            max_length=self.data_config.max_length,
-            add_special_tokens=True,
-            return_tensors="pt",
+        # Tokenize prompt and output SEPARATELY then concatenate token IDs.
+        # This avoids BPE boundary issues where tokenizing them as one string
+        # produces different tokens at the junction, causing label mask errors.
+        prompt_ids: List[int] = self.tokenizer.encode(
+            prompt_text, add_special_tokens=True,
         )
-        full_encoding = self.tokenizer(
-            full_text,
-            truncation=True,
-            max_length=self.data_config.max_length,
-            add_special_tokens=True,
-            return_tensors="pt",
+        # Response tokens: no special tokens (BOS already in prompt, EOS in output_text if configured)
+        response_ids: List[int] = self.tokenizer.encode(
+            output_text, add_special_tokens=False,
         )
 
-        input_ids = full_encoding["input_ids"].squeeze(0)
-        attention_mask = full_encoding["attention_mask"].squeeze(0)
-        labels = input_ids.clone()
+        # Truncate to max_length
+        max_len = self.data_config.max_length
+        total_len = len(prompt_ids) + len(response_ids)
+        if total_len > max_len:
+            # Keep full prompt, truncate response
+            available = max_len - len(prompt_ids)
+            if available > 0:
+                response_ids = response_ids[:available]
+            else:
+                prompt_ids = prompt_ids[:max_len]
+                response_ids = []
 
-        prompt_token_count = int(prompt_encoding["input_ids"].size(1))
-        labels[:prompt_token_count] = -100
+        # Build input_ids and labels from the two separate token lists
+        all_ids = prompt_ids + response_ids
+        labels_list = [-100] * len(prompt_ids) + response_ids
+
+        input_ids = torch.tensor(all_ids, dtype=torch.long)
+        attention_mask = torch.ones_like(input_ids)
+        labels = torch.tensor(labels_list, dtype=torch.long)
+
         # True  -> masked (no history lookup at this token)
         # False -> unmasked (history lookup allowed)
         history_lookup_mask = self._build_history_lookup_mask(labels)
@@ -263,4 +273,3 @@ class ImmDataCollator:
         batch["history_attention_mask"] = history_attention_mask
         batch["history_line_mask"] = history_line_mask
         return batch
-

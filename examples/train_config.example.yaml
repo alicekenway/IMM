@@ -106,10 +106,16 @@ training:
   max_grad_norm: 1.0
   # Print training loss every N global steps. Use a positive integer.
   log_every_steps: 10
-  # Reserved for periodic checkpoint saving.
-  # Note: the current trainer saves only once at the end, so this is not used yet.
+  # Save a checkpoint every N global steps into output_dir/checkpoint_{step}/.
+  # Set to 0 to disable periodic checkpointing (final model is always saved).
   save_every_steps: 0
-  # Directory where the final tokenizer and model artifacts are saved.
+  # Directory where checkpoints and the final model are saved.
+  # Periodic checkpoints go to output_dir/checkpoint_{step}/,
+  # and the final model goes to output_dir/final/.
   output_dir: "outputs/imm_qwen"
   # Random seed for reproducible data order and initialization behavior.
   seed: 42
+  # Path to a checkpoint directory to resume training from.
+  # Restores LoRA weights, IMM weights, optimizer state, epoch, and step.
+  # Can also be overridden via the --resume CLI argument.
+  # resume_from_checkpoint: "outputs/imm_qwen/checkpoint_500"

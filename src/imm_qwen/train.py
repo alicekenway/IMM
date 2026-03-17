@@ -1,6 +1,7 @@
 import argparse
 import random
 import time
+from dataclasses import asdict
 from pathlib import Path
 from typing import Any, Dict, Tuple
 
@@ -26,7 +27,10 @@ from .train_tools import (
     build_loss_bundle,
     build_model_with_imm,
     build_optimizer_groups,
+    load_checkpoint,
+    load_optimizer_state,
     resolve_imm_adapter,
+    save_checkpoint,
 )
 
 
@@ -104,6 +108,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--config", type=str, required=True, help="Path to training config YAML."
     )
+    parser.add_argument(
+        "--resume", type=str, default=None,
+        help="Path to checkpoint directory to resume from (overrides config).",
+    )
     return parser
 
 
@@ -112,6 +120,9 @@ def main() -> None:
     payload = _load_yaml(args.config)
     project_config, data_config, training_config = _build_project_config(payload)
     _set_seed(training_config.seed)
+
+    # Resolve checkpoint resume path (CLI --resume overrides config)
+    resume_dir = args.resume or training_config.resume_from_checkpoint
 
     # All IMM parameters are used inside dual_stream_forward (called from
     # the DDP-tracked forward), so find_unused_parameters is not needed.
@@ -122,6 +133,20 @@ def main() -> None:
     )
 
     artifacts = build_model_with_imm(project_config)
+
+    # Load LoRA + IMM weights from checkpoint before accelerator.prepare
+    resumed_state: Dict[str, Any] = {}
+    if resume_dir is not None:
+        accelerator.print(f"Resuming from checkpoint: {resume_dir}")
+        resumed_state = load_checkpoint(
+            checkpoint_dir=resume_dir,
+            model=artifacts.model,
+            optimizer=None,  # optimizer loaded after prepare
+        )
+        accelerator.print(
+            f"Restored weights from step={resumed_state.get('global_step', '?')} "
+            f"epoch={resumed_state.get('epoch', '?')}"
+        )
 
     dataset = ImmSupervisedDataset(
         tokenizer=artifacts.tokenizer,
@@ -148,17 +173,39 @@ def main() -> None:
         artifacts.model, optimizer, train_dataloader
     )
 
+    # Load optimizer state after accelerator.prepare (device mapping is ready)
+    if resume_dir is not None:
+        load_optimizer_state(resume_dir, optimizer)
+        accelerator.print("Restored optimizer state.")
+
+    # Determine starting epoch and step from checkpoint
+    start_epoch = int(resumed_state.get("epoch", 0))
+    global_step = int(resumed_state.get("global_step", 0))
+
     model.train()
-    global_step = 0
+    output_dir = Path(training_config.output_dir)
+
+    # Serializable training config for checkpoint metadata
+    training_config_dict = {
+        "learning_rate_lora": training_config.learning_rate_lora,
+        "learning_rate_imm": training_config.learning_rate_imm,
+        "weight_decay": training_config.weight_decay,
+        "batch_size": training_config.batch_size,
+        "max_grad_norm": training_config.max_grad_norm,
+        "grad_accum_steps": training_config.grad_accum_steps,
+        "seed": training_config.seed,
+    }
+
     accelerator.print(
         f"dataset_size={len(dataset)} "
         f"batches_per_epoch={len(train_dataloader)} "
         f"batch_size={training_config.batch_size} "
         f"num_workers={training_config.num_workers} "
-        f"grad_accum_steps={training_config.grad_accum_steps}"
+        f"grad_accum_steps={training_config.grad_accum_steps} "
+        f"start_epoch={start_epoch} start_step={global_step}"
     )
 
-    for epoch_index in range(training_config.num_epochs):
+    for epoch_index in range(start_epoch, training_config.num_epochs):
         epoch_start = time.time()
         for batch_index, batch in enumerate(train_dataloader):
             global_step += 1
@@ -173,8 +220,6 @@ def main() -> None:
 
             with accelerator.accumulate(model):
                 forward_start = time.time()
-                # Single forward call: the model dispatches to
-                # dual_stream_forward when history_input_ids is present.
                 outputs = model(
                     input_ids=batch["input_ids"],
                     attention_mask=batch["attention_mask"],
@@ -218,18 +263,42 @@ def main() -> None:
                     f"loss={loss_value:.6f} batch={batch_index}"
                 )
 
+            # Periodic checkpoint saving
+            if (
+                training_config.save_every_steps > 0
+                and global_step % training_config.save_every_steps == 0
+            ):
+                accelerator.wait_for_everyone()
+                if accelerator.is_main_process:
+                    ckpt_dir = output_dir / f"checkpoint_{global_step}"
+                    save_checkpoint(
+                        checkpoint_dir=ckpt_dir.as_posix(),
+                        model=accelerator.unwrap_model(model),
+                        optimizer=optimizer,
+                        tokenizer=artifacts.tokenizer,
+                        epoch=epoch_index,
+                        global_step=global_step,
+                        training_config_dict=training_config_dict,
+                    )
+                    accelerator.print(f"Saved checkpoint: {ckpt_dir}")
+
         elapsed = time.time() - epoch_start
         accelerator.print(f"epoch={epoch_index} completed in {elapsed:.2f}s")
 
+    # --- save final model ---------------------------------------------------
     accelerator.wait_for_everyone()
-
-    output_dir = Path(training_config.output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
-    unwrapped_model = accelerator.unwrap_model(model)
     if accelerator.is_main_process:
-        artifacts.tokenizer.save_pretrained(output_dir.as_posix())
-        if hasattr(unwrapped_model, "save_pretrained"):
-            unwrapped_model.save_pretrained(output_dir.as_posix())
+        final_dir = output_dir / "final"
+        save_checkpoint(
+            checkpoint_dir=final_dir.as_posix(),
+            model=accelerator.unwrap_model(model),
+            optimizer=optimizer,
+            tokenizer=artifacts.tokenizer,
+            epoch=training_config.num_epochs,
+            global_step=global_step,
+            training_config_dict=training_config_dict,
+        )
+        accelerator.print(f"Saved final model: {final_dir}")
 
     accelerator.print("IMM-Qwen training completed.")
     accelerator.print(f"dataset_size={len(dataset)}")

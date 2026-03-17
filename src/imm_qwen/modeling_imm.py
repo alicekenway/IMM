@@ -175,9 +175,14 @@ class ImplicitMemoryModule(nn.Module):
 
         retrieved = torch.einsum("btn,bnd->btd", weights, memory_values)  # [B, T, value_dim]
 
-        if history_lookup_mask is not None:
-            allowed = (~history_lookup_mask).unsqueeze(-1).to(retrieved.dtype)
-            retrieved = retrieved * allowed
+        # Apply controller merge gate (scales by session_merge_gate and
+        # masks out positions where history_lookup_mask is True).
+        retrieved = self.controller.merge_gate(
+            hidden_states=hidden_states,
+            retrieved_states=retrieved,
+            scope="session",
+            history_lookup_mask=history_lookup_mask,
+        )
 
         merged = self.output_proj(retrieved)
         return self.merge_norm(hidden_states + merged)

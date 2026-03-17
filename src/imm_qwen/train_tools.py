@@ -1,4 +1,6 @@
+import json
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import torch
@@ -181,15 +183,156 @@ def build_optimizer_groups(
     return groups
 
 
+def _collect_imm_state_dict(model: torch.nn.Module) -> Dict[str, torch.Tensor]:
+    """Extract IMM module parameters from the model (works through DDP/PEFT wrappers)."""
+    imm_adapter = resolve_imm_adapter(model)
+    state: Dict[str, torch.Tensor] = {}
+    for name, param in imm_adapter.named_parameters():
+        if "imm_module" in name:
+            state[name] = param.data.clone()
+    return state
+
+
+def _load_imm_state_dict(model: torch.nn.Module, state_dict: Dict[str, torch.Tensor]) -> None:
+    """Load IMM module parameters back into the model."""
+    imm_adapter = resolve_imm_adapter(model)
+    own_state = dict(imm_adapter.named_parameters())
+    loaded = 0
+    for name, saved_tensor in state_dict.items():
+        if name in own_state:
+            own_state[name].data.copy_(saved_tensor)
+            loaded += 1
+    if loaded == 0 and len(state_dict) > 0:
+        raise ValueError(
+            f"IMM state dict has {len(state_dict)} entries but none matched model parameters."
+        )
+
+
+def save_checkpoint(
+    checkpoint_dir: str,
+    model: torch.nn.Module,
+    optimizer: torch.optim.Optimizer,
+    tokenizer: Any,
+    epoch: int,
+    global_step: int,
+    training_config_dict: Dict[str, Any],
+) -> None:
+    """Save a full checkpoint: LoRA adapter, IMM weights, optimizer, training state."""
+    ckpt_path = Path(checkpoint_dir)
+    ckpt_path.mkdir(parents=True, exist_ok=True)
+
+    unwrapped = model
+    # Unwrap DDP / accelerate wrappers
+    while hasattr(unwrapped, "module"):
+        unwrapped = unwrapped.module
+
+    # Save LoRA adapter (via PEFT save_pretrained if available)
+    lora_dir = ckpt_path / "lora_adapter"
+    if hasattr(unwrapped, "save_pretrained"):
+        unwrapped.save_pretrained(lora_dir.as_posix())
+
+    # Save IMM module weights separately
+    imm_state = _collect_imm_state_dict(unwrapped)
+    torch.save(imm_state, (ckpt_path / "imm_modules.pt").as_posix())
+
+    # Save optimizer state
+    torch.save(optimizer.state_dict(), (ckpt_path / "optimizer.pt").as_posix())
+
+    # Save tokenizer
+    tokenizer_dir = ckpt_path / "tokenizer"
+    tokenizer_dir.mkdir(parents=True, exist_ok=True)
+    tokenizer.save_pretrained(tokenizer_dir.as_posix())
+
+    # Save training state (for resume)
+    training_state = {
+        "epoch": epoch,
+        "global_step": global_step,
+        **training_config_dict,
+    }
+    (ckpt_path / "training_state.json").write_text(
+        json.dumps(training_state, indent=2), encoding="utf-8"
+    )
+
+
+def load_checkpoint(
+    checkpoint_dir: str,
+    model: torch.nn.Module,
+    optimizer: Optional[torch.optim.Optimizer] = None,
+) -> Dict[str, Any]:
+    """Load checkpoint weights and return the saved training state.
+
+    Must be called BEFORE accelerator.prepare() for LoRA/IMM weights,
+    but optimizer state is loaded AFTER accelerator.prepare() wraps the
+    optimizer — so ``optimizer`` may be None on the first call and
+    loaded separately via ``load_optimizer_state``.
+    """
+    ckpt_path = Path(checkpoint_dir)
+    if not ckpt_path.exists():
+        raise FileNotFoundError(f"Checkpoint dir not found: {checkpoint_dir}")
+
+    unwrapped = model
+    while hasattr(unwrapped, "module"):
+        unwrapped = unwrapped.module
+
+    # Load LoRA adapter weights
+    lora_dir = ckpt_path / "lora_adapter"
+    if lora_dir.exists():
+        try:
+            from peft import set_peft_model_state_dict
+            from safetensors.torch import load_file as load_safetensors
+
+            adapter_file = lora_dir / "adapter_model.safetensors"
+            if adapter_file.exists():
+                lora_state = load_safetensors(adapter_file.as_posix())
+            else:
+                bin_file = lora_dir / "adapter_model.bin"
+                lora_state = torch.load(bin_file.as_posix(), map_location="cpu", weights_only=True)
+            set_peft_model_state_dict(unwrapped, lora_state)
+        except ImportError:
+            pass
+
+    # Load IMM module weights
+    imm_file = ckpt_path / "imm_modules.pt"
+    if imm_file.exists():
+        imm_state = torch.load(imm_file.as_posix(), map_location="cpu", weights_only=True)
+        _load_imm_state_dict(unwrapped, imm_state)
+
+    # Load optimizer if provided
+    if optimizer is not None:
+        opt_file = ckpt_path / "optimizer.pt"
+        if opt_file.exists():
+            optimizer.load_state_dict(
+                torch.load(opt_file.as_posix(), map_location="cpu", weights_only=True)
+            )
+
+    # Load training state
+    state_file = ckpt_path / "training_state.json"
+    if state_file.exists():
+        return json.loads(state_file.read_text(encoding="utf-8"))
+    return {}
+
+
+def load_optimizer_state(checkpoint_dir: str, optimizer: torch.optim.Optimizer) -> None:
+    """Load optimizer state dict from a checkpoint (call after accelerator.prepare)."""
+    opt_file = Path(checkpoint_dir) / "optimizer.pt"
+    if opt_file.exists():
+        optimizer.load_state_dict(
+            torch.load(opt_file.as_posix(), map_location="cpu", weights_only=True)
+        )
+
+
 def build_loss_bundle(
     logits: torch.Tensor,
     labels: torch.Tensor,
     auxiliary_losses: Optional[Dict[str, torch.Tensor]] = None,
 ) -> Dict[str, torch.Tensor]:
-    vocab_size = logits.size(-1)
+    # Standard causal LM shift: logits[t] predicts token t+1.
+    shift_logits = logits[..., :-1, :].contiguous()
+    shift_labels = labels[..., 1:].contiguous()
+    vocab_size = shift_logits.size(-1)
     lm_loss = torch.nn.functional.cross_entropy(
-        logits.view(-1, vocab_size),
-        labels.view(-1),
+        shift_logits.view(-1, vocab_size),
+        shift_labels.view(-1),
         ignore_index=-100,
     )
     total_loss = lm_loss
