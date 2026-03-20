@@ -71,6 +71,9 @@ lora:
 data:
   # Path to the supervised training dataset JSON file.
   dataset_path: "../v1_train_sample.json"
+  # Path to the validation dataset JSON file (same format as training set).
+  # Required when eval_every_steps > 0.
+  # eval_dataset_path: "../v1_eval_sample.json"
   # Maximum token length for the present-turn training sequence
   # after prompt + target are combined and tokenized.
   max_length: 1024
@@ -119,3 +122,13 @@ training:
   # Restores LoRA weights, IMM weights, optimizer state, epoch, and step.
   # Can also be overridden via the --resume CLI argument.
   # resume_from_checkpoint: "outputs/imm_qwen/checkpoint_500"
+  # Run validation every N global steps. Set to 0 to disable.
+  # Requires data.eval_dataset_path to be set.
+  eval_every_steps: 0
+  # Batch size for the teacher-forced loss pass during validation.
+  # Generation pass always runs sample-by-sample (memory bank is per-sample).
+  eval_batch_size: 1
+  # Maximum new tokens for autoregressive generation during validation.
+  eval_max_new_tokens: 128
+  # Temperature for validation generation. 0.0 = greedy (deterministic).
+  eval_temperature: 0.0

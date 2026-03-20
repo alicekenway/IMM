@@ -130,7 +130,12 @@ class InferenceEngine:
         attention_mask = model_inputs["attention_mask"].to(device)
 
         # Query existing memory during generation.
-        adapter.set_present_query_mode(history_lookup_mask=None)
+        # Prompt tokens are masked from memory (consistent with training),
+        # generated tokens beyond prompt_length are allowed to read memory.
+        adapter.set_present_query_mode(
+            history_lookup_mask=None,
+            prompt_length=input_ids.size(1),
+        )
 
         with torch.no_grad():
             generated = self.model.generate(

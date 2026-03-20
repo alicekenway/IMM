@@ -1,14 +1,15 @@
 import json
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 
 import torch
+from torch.utils.data import DataLoader
 
-from .config import ImmQwenProjectConfig
+from .config import ImmQwenProjectConfig, TrainingToolConfig
 from .controller import RuleBasedMemoryController
-from .data_llamafactory import ImmDataCollator
-from .modeling_imm import QwenImmAdapter
+from .data_llamafactory import ImmDataCollator, ImmSupervisedDataset
+from .modeling_imm import QwenImmAdapter, QwenImmLayerWrapper
 
 
 @dataclass
@@ -343,3 +344,265 @@ def build_loss_bundle(
             total_loss = total_loss + value
     loss_bundle["total_loss"] = total_loss
     return loss_bundle
+
+
+def _per_sample_loss(
+    logits: torch.Tensor, labels: torch.Tensor,
+) -> Tuple[List[float], List[int]]:
+    """Compute cross-entropy loss and target token count per sample.
+
+    Uses ``reduction='sum'`` and divides manually so that the caller can
+    aggregate token-weighted averages identical to ``build_loss_bundle``.
+
+    Returns:
+        losses:       per-sample mean loss (for logging each sample)
+        token_counts: number of non-ignored target tokens per sample
+    """
+    shift_logits = logits[..., :-1, :].contiguous()
+    shift_labels = labels[..., 1:].contiguous()
+    B = shift_logits.size(0)
+    vocab_size = shift_logits.size(-1)
+    losses: List[float] = []
+    token_counts: List[int] = []
+    for i in range(B):
+        flat_logits = shift_logits[i].view(-1, vocab_size)
+        flat_labels = shift_labels[i].view(-1)
+        n_tokens = int((flat_labels != -100).sum().item())
+        if n_tokens == 0:
+            losses.append(0.0)
+            token_counts.append(0)
+            continue
+        sample_sum = torch.nn.functional.cross_entropy(
+            flat_logits, flat_labels, ignore_index=-100, reduction="sum",
+        )
+        losses.append(float(sample_sum.item()) / n_tokens)
+        token_counts.append(n_tokens)
+    return losses, token_counts
+
+
+def _prefill_history_for_generation(
+    model: torch.nn.Module,
+    adapter: QwenImmAdapter,
+    history_input_ids: torch.Tensor,
+    history_attention_mask: torch.Tensor,
+    history_line_mask: torch.Tensor,
+) -> None:
+    """Run history turns through the model in history_collect mode to populate
+    the per-layer memory banks for autoregressive generation."""
+    B, H, T_h = history_input_ids.shape
+    if H == 0 or not history_line_mask.any():
+        return
+    for h_idx in range(H):
+        valid_in_batch = history_line_mask[:, h_idx]  # [B]
+        if not valid_in_batch.any():
+            continue
+        turn_ids = history_input_ids[:, h_idx, :]       # [B, T_h]
+        turn_mask = history_attention_mask[:, h_idx, :]  # [B, T_h]
+        row_mask = valid_in_batch  # [B] bool
+        adapter.set_history_collect_mode(
+            attention_mask=turn_mask, row_mask=row_mask,
+        )
+        with torch.no_grad():
+            model(input_ids=turn_ids, attention_mask=turn_mask, use_cache=False)
+    adapter.set_passthrough_mode()
+
+
+def _extract_prompt_and_target(
+    input_ids: torch.Tensor,
+    attention_mask: torch.Tensor,
+    labels: torch.Tensor,
+    pad_token_id: int,
+) -> Tuple[torch.Tensor, torch.Tensor, List[torch.Tensor]]:
+    """Build left-padded prompt batch and collect target token lists for decoding.
+
+    Args:
+        input_ids:      [B, T]
+        attention_mask: [B, T]
+        labels:         [B, T]
+        pad_token_id:   int
+
+    Returns:
+        prompt_ids:   [B, max_prompt_len]  (left-padded)
+        prompt_mask:  [B, max_prompt_len]
+        target_token_lists: list of B tensors, each containing the unpadded
+                            target token ids for that sample.
+    """
+    B = input_ids.size(0)
+    prompt_lengths: List[int] = []
+    target_token_lists: List[torch.Tensor] = []
+
+    for i in range(B):
+        target_positions = labels[i].ne(-100)
+        if target_positions.any():
+            first_target = int(target_positions.nonzero(as_tuple=False)[0, 0])
+            prompt_lengths.append(first_target)
+            # Collect target tokens, exclude padding
+            tgt = input_ids[i, first_target:]
+            valid_len = int(attention_mask[i, first_target:].sum().item())
+            target_token_lists.append(tgt[:valid_len])
+        else:
+            # No target tokens — whole sequence is prompt
+            valid_len = int(attention_mask[i].sum().item())
+            prompt_lengths.append(valid_len)
+            target_token_lists.append(torch.tensor([], dtype=torch.long, device=input_ids.device))
+
+    max_prompt_len = max(prompt_lengths) if prompt_lengths else 1
+    prompt_ids = torch.full(
+        (B, max_prompt_len), fill_value=pad_token_id,
+        dtype=torch.long, device=input_ids.device,
+    )
+    prompt_mask = torch.zeros(
+        (B, max_prompt_len), dtype=torch.long, device=input_ids.device,
+    )
+    # Left-pad prompts so that the last token is aligned across the batch
+    for i in range(B):
+        plen = prompt_lengths[i]
+        prompt_ids[i, max_prompt_len - plen:] = input_ids[i, :plen]
+        prompt_mask[i, max_prompt_len - plen:] = 1
+
+    return prompt_ids, prompt_mask, target_token_lists
+
+
+def _move_batch_to_device(
+    batch: Dict[str, torch.Tensor], device: torch.device,
+) -> Dict[str, torch.Tensor]:
+    """Move all tensors in a batch dict to the given device."""
+    return {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
+
+
+def run_validation(
+    model: torch.nn.Module,
+    val_dataloader: DataLoader,
+    tokenizer: Any,
+    training_config: TrainingToolConfig,
+    global_step: int,
+    device: torch.device,
+    log_fn: Callable[[str], None],
+) -> float:
+    """Run two-pass validation: teacher-forced loss then autoregressive generation.
+
+    Pass 1: Iterate val_dataloader — dual_stream_forward on batches, compute
+            per-sample loss and print each immediately.
+    Pass 2: Iterate val_dataloader again — for each batch, prefill history into
+            memory bank, build batched prompts, run batched generate(), decode
+            and print each sample immediately.
+
+    The val_dataloader is not accelerator-prepared, so batches are moved to
+    device manually.
+
+    Returns the average loss across all samples.
+    """
+    model.eval()
+    adapter = resolve_imm_adapter(model)
+
+    total_weighted_loss: float = 0.0
+    total_tokens: int = 0
+    num_samples: int = 0
+
+    log_fn(f"===== Validation at step {global_step} =====")
+
+    # --- Pass 1: teacher-forced loss via dual_stream_forward -----------------
+    log_fn("--- Pass 1: teacher-forced loss ---")
+    sample_offset = 0
+    with torch.no_grad():
+        for batch in val_dataloader:
+            batch = _move_batch_to_device(batch, device)
+            outputs = model(
+                input_ids=batch["input_ids"],
+                attention_mask=batch["attention_mask"],
+                history_input_ids=batch["history_input_ids"],
+                history_attention_mask=batch["history_attention_mask"],
+                history_line_mask=batch["history_line_mask"],
+                history_lookup_mask=batch["history_lookup_mask"],
+                use_cache=False,
+                return_dict=True,
+            )
+            batch_losses, batch_token_counts = _per_sample_loss(
+                outputs.logits, batch["labels"],
+            )
+            B = batch["input_ids"].size(0)
+            for i in range(B):
+                sample_idx = sample_offset + i
+                log_fn(f"  [sample {sample_idx}] loss={batch_losses[i]:.4f} tokens={batch_token_counts[i]}")
+                total_weighted_loss += batch_losses[i] * batch_token_counts[i]
+                total_tokens += batch_token_counts[i]
+                num_samples += 1
+            sample_offset += B
+
+    avg_loss = total_weighted_loss / total_tokens if total_tokens > 0 else 0.0
+    log_fn(f"--- average_loss={avg_loss:.4f} (N={num_samples}, tokens={total_tokens}) ---")
+
+    # --- Pass 2: batched autoregressive generation with memory bank ----------
+    log_fn("--- Pass 2: autoregressive generation ---")
+    gen_kwargs: Dict[str, Any] = {
+        "max_new_tokens": training_config.eval_max_new_tokens,
+    }
+    if training_config.eval_temperature <= 0.0:
+        gen_kwargs["do_sample"] = False
+    else:
+        gen_kwargs["do_sample"] = True
+        gen_kwargs["temperature"] = training_config.eval_temperature
+
+    pad_token_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else 0
+
+    sample_offset = 0
+    with torch.no_grad():
+        for batch in val_dataloader:
+            batch = _move_batch_to_device(batch, device)
+            B = batch["input_ids"].size(0)
+
+            # 1. Clear memory and prefill history for this batch
+            adapter.clear_all_memory_slots()
+            _prefill_history_for_generation(
+                model=model,
+                adapter=adapter,
+                history_input_ids=batch["history_input_ids"],
+                history_attention_mask=batch["history_attention_mask"],
+                history_line_mask=batch["history_line_mask"],
+            )
+
+            # 2. Build batched prompt (left-padded) and target token lists
+            prompt_ids, prompt_mask, target_token_lists = _extract_prompt_and_target(
+                input_ids=batch["input_ids"],
+                attention_mask=batch["attention_mask"],
+                labels=batch["labels"],
+                pad_token_id=pad_token_id,
+            )
+
+            # 3. Set present_query mode with prompt_length so that prompt
+            #    tokens do NOT read memory (consistent with training) while
+            #    generated tokens beyond the prompt are allowed to read.
+            adapter.set_present_query_mode(
+                history_lookup_mask=None,
+                prompt_length=prompt_ids.size(1),
+            )
+
+            # 4. Batched generate
+            generated = model.generate(
+                input_ids=prompt_ids,
+                attention_mask=prompt_mask,
+                pad_token_id=pad_token_id,
+                **gen_kwargs,
+            )
+
+            # 5. Decode and print each sample immediately
+            prompt_len = prompt_ids.size(1)
+            for i in range(B):
+                gen_tokens = generated[i, prompt_len:]
+                target_text = tokenizer.decode(
+                    target_token_lists[i], skip_special_tokens=True,
+                )
+                gen_text = tokenizer.decode(gen_tokens, skip_special_tokens=True)
+                sample_idx = sample_offset + i
+                log_fn(f"  [sample {sample_idx}]")
+                log_fn(f"    target:    {target_text}")
+                log_fn(f"    generated: {gen_text}")
+
+            # 6. Clean up for next batch
+            adapter.set_passthrough_mode()
+            adapter.clear_all_memory_slots()
+            sample_offset += B
+
+    log_fn(f"===== Validation done (step {global_step}, avg_loss={avg_loss:.4f}) =====")
+    model.train()
+    return avg_loss

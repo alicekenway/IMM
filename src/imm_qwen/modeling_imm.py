@@ -214,6 +214,8 @@ class QwenImmLayerWrapper(nn.Module):
         self._history_attention_mask: Optional[torch.Tensor] = None
         self._history_row_mask: Optional[torch.Tensor] = None
         self._history_lookup_mask: Optional[torch.Tensor] = None
+        self._prompt_length: int = 0       # for dynamic mask during generate()
+        self._generated_steps: int = 0     # tokens generated so far
 
     # ---- mode setters (inference only) --------------------------------------
 
@@ -229,9 +231,12 @@ class QwenImmLayerWrapper(nn.Module):
     def set_present_query_mode(
         self,
         history_lookup_mask: Optional[torch.Tensor] = None,
+        prompt_length: int = 0,
     ) -> None:
         self._mode = "present_query"
         self._history_lookup_mask = history_lookup_mask
+        self._prompt_length = prompt_length
+        self._generated_steps = 0
 
     def set_passthrough_mode(self) -> None:
         self._mode = "passthrough"
@@ -303,12 +308,35 @@ class QwenImmLayerWrapper(nn.Module):
                 if self._collected_valid
                 else None
             )
+
+            # Build dynamic history_lookup_mask consistent with training:
+            # prompt tokens are masked (True = no lookup), generated tokens
+            # are unmasked (False = allowed to read memory).
+            lookup_mask = self._history_lookup_mask
+            if lookup_mask is None and self._prompt_length > 0:
+                T_cur = hidden_states.size(1)
+                B_cur = hidden_states.size(0)
+                current_pos = self._prompt_length + self._generated_steps
+                if T_cur == 1:
+                    # Autoregressive step: single new token
+                    # Positions >= prompt_length are target tokens → allowed
+                    lookup_mask = torch.tensor(
+                        [[current_pos < self._prompt_length]],
+                        dtype=torch.bool, device=hidden_states.device,
+                    ).expand(B_cur, -1)
+                    self._generated_steps += 1
+                else:
+                    # Prefill step: full prompt
+                    # Mask prompt tokens (True), unmask any beyond prompt_length
+                    positions = torch.arange(T_cur, device=hidden_states.device)
+                    lookup_mask = (positions < self._prompt_length).unsqueeze(0).expand(B_cur, -1)
+
             hidden_out = self.imm_module.query_and_merge(
                 hidden_states=hidden_states,
                 memory_keys=keys,
                 memory_values=values,
                 valid_mask=valid_mask,
-                history_lookup_mask=self._history_lookup_mask,
+                history_lookup_mask=lookup_mask,
             )
             if isinstance(base_output, tuple):
                 return (hidden_out, *base_output[1:])
@@ -562,9 +590,13 @@ class QwenImmAdapter(nn.Module):
     def set_present_query_mode(
         self,
         history_lookup_mask: Optional[torch.Tensor] = None,
+        prompt_length: int = 0,
     ) -> None:
         for w in self.wrapped_layers:
-            w.set_present_query_mode(history_lookup_mask=history_lookup_mask)
+            w.set_present_query_mode(
+                history_lookup_mask=history_lookup_mask,
+                prompt_length=prompt_length,
+            )
 
     def set_passthrough_mode(self) -> None:
         for w in self.wrapped_layers:

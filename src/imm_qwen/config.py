@@ -67,6 +67,7 @@ class LoraConfigSpec:
 @dataclass(frozen=True)
 class DataSchemaConfig:
     dataset_path: str
+    eval_dataset_path: Optional[str] = None
     max_length: int = 2048
     max_history_line_length: int = 256
     max_history_lines: int = 32
@@ -100,6 +101,10 @@ class TrainingToolConfig:
     output_dir: str = "outputs/imm_qwen"
     seed: int = 42
     resume_from_checkpoint: Optional[str] = None
+    eval_every_steps: int = 0
+    eval_batch_size: int = 1
+    eval_max_new_tokens: int = 128
+    eval_temperature: float = 0.0
 
 
 @dataclass(frozen=True)

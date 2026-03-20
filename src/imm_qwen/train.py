@@ -30,6 +30,7 @@ from .train_tools import (
     load_checkpoint,
     load_optimizer_state,
     resolve_imm_adapter,
+    run_validation,
     save_checkpoint,
 )
 
@@ -161,6 +162,35 @@ def main() -> None:
         collate_fn=artifacts.data_collator,
     )
 
+    # Build validation dataloader if eval dataset is provided.
+    # The val_dataloader is intentionally NOT passed through accelerator.prepare()
+    # so it remains non-sharded.  Only the main process runs validation; other
+    # ranks wait at a barrier.  Batches are moved to device manually inside
+    # run_validation via the model's own device.
+    val_dataloader = None
+    if data_config.eval_dataset_path and training_config.eval_every_steps > 0:
+        eval_data_config = DataSchemaConfig(
+            dataset_path=data_config.eval_dataset_path,
+            max_length=data_config.max_length,
+            max_history_line_length=data_config.max_history_line_length,
+            max_history_lines=data_config.max_history_lines,
+            include_history=data_config.include_history,
+            append_eos_token=data_config.append_eos_token,
+            derive_history_lookup_mask_from_labels=data_config.derive_history_lookup_mask_from_labels,
+        )
+        val_dataset = ImmSupervisedDataset(
+            tokenizer=artifacts.tokenizer,
+            data_config=eval_data_config,
+        )
+        val_dataloader = DataLoader(
+            val_dataset,
+            batch_size=training_config.eval_batch_size,
+            shuffle=False,
+            num_workers=0,
+            collate_fn=artifacts.data_collator,
+        )
+        accelerator.print(f"eval_dataset_size={len(val_dataset)} eval_every_steps={training_config.eval_every_steps}")
+
     optimizer_groups = build_optimizer_groups(
         model=artifacts.model,
         lora_lr=training_config.learning_rate_lora,
@@ -281,6 +311,26 @@ def main() -> None:
                         training_config_dict=training_config_dict,
                     )
                     accelerator.print(f"Saved checkpoint: {ckpt_dir}")
+
+            # Periodic validation (main process only, other ranks wait at barrier)
+            if (
+                val_dataloader is not None
+                and training_config.eval_every_steps > 0
+                and global_step % training_config.eval_every_steps == 0
+            ):
+                accelerator.wait_for_everyone()
+                if accelerator.is_main_process:
+                    device = accelerator.device
+                    run_validation(
+                        model=model,
+                        val_dataloader=val_dataloader,
+                        tokenizer=artifacts.tokenizer,
+                        training_config=training_config,
+                        global_step=global_step,
+                        device=device,
+                        log_fn=accelerator.print,
+                    )
+                accelerator.wait_for_everyone()
 
         elapsed = time.time() - epoch_start
         accelerator.print(f"epoch={epoch_index} completed in {elapsed:.2f}s")
