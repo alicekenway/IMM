@@ -49,7 +49,7 @@ def build_tokenizer(project_config: ImmQwenProjectConfig):
     return tokenizer
 
 
-def build_base_causal_lm_model(project_config: ImmQwenProjectConfig):
+def build_original_causal_lm_model(project_config: ImmQwenProjectConfig):
     from transformers import AutoModelForCausalLM
 
     torch_dtype = resolve_torch_dtype(project_config.model.torch_dtype)
@@ -92,14 +92,14 @@ def mark_imm_parameters_trainable(model: torch.nn.Module) -> None:
 
 def build_model_with_imm(project_config: ImmQwenProjectConfig) -> TrainBuildArtifacts:
     tokenizer = build_tokenizer(project_config)
-    base_model = build_base_causal_lm_model(project_config)
-    base_model.resize_token_embeddings(len(tokenizer))
+    original_model = build_original_causal_lm_model(project_config)
+    original_model.resize_token_embeddings(len(tokenizer))
 
-    hidden_dim = int(base_model.config.hidden_size)
+    hidden_dim = int(original_model.config.hidden_size)
     controller = RuleBasedMemoryController(project_config.controller)
 
     wrapped_model = QwenImmAdapter(
-        base_model=base_model,
+        original_model=original_model,
         placement_config=project_config.placement,
         controller=controller,
         hidden_dim=hidden_dim,
