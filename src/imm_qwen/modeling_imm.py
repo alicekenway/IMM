@@ -355,7 +355,7 @@ class QwenImmAdapter(nn.Module):
     Training uses ``dual_stream_forward`` which manually iterates through
     layers so that all IMM parameters appear in a single DDP-tracked
     forward pass.  Inference uses the mode-based wrapper mechanism via
-    the normal ``forward`` -> wrapped original-model delegation.
+    the normal ``forward`` -> instrumented-model delegation.
     """
 
     def __init__(
@@ -369,12 +369,15 @@ class QwenImmAdapter(nn.Module):
         summary_config: Optional[TurnSummaryConfig] = None,
     ) -> None:
         super().__init__()
-        self.original_model = original_model
+        # Starts as the original HF model, then selected decoder layers are
+        # replaced in-place with IMM wrappers. This is the runtime model used
+        # for normal forward() and generate().
+        self.instrumented_model = original_model
         self.placement_config = placement_config
         self.controller = controller
         self.summary_config = summary_config
 
-        layers = self._locate_decoder_layers(original_model)
+        layers = self._locate_decoder_layers(self.instrumented_model)
         selected_indices = _resolve_selected_layer_indices(
             total_layers=len(layers),
             placement_config=placement_config,
@@ -397,24 +400,29 @@ class QwenImmAdapter(nn.Module):
 
     @property
     def config(self):
-        return self.original_model.config
+        return self.instrumented_model.config
 
     @property
     def generation_config(self):
-        return self.original_model.generation_config
+        return self.instrumented_model.generation_config
 
     @generation_config.setter
     def generation_config(self, value) -> None:
-        self.original_model.generation_config = value
+        self.instrumented_model.generation_config = value
 
     @property
     def main_input_name(self):
-        return self.original_model.main_input_name
+        return self.instrumented_model.main_input_name
+
+    @property
+    def original_model(self):
+        """Compatibility alias for the model object originally passed in."""
+        return self.instrumented_model
 
     @property
     def base_model(self):
         """Compatibility alias for code that expects a Hugging Face-style wrapper."""
-        return self.original_model
+        return self.instrumented_model
 
     # ---- forward dispatch ---------------------------------------------------
 
@@ -438,7 +446,7 @@ class QwenImmAdapter(nn.Module):
                 present_attention_mask=attention_mask,
                 history_lookup_mask=history_lookup_mask,
             )
-        return self.original_model(
+        return self.instrumented_model(
             input_ids=input_ids,
             attention_mask=attention_mask,
             **kwargs,
@@ -476,7 +484,7 @@ class QwenImmAdapter(nn.Module):
 
         # --- fast path: no history -------------------------------------------
         if H == 0 or not history_line_mask.any():
-            return self.original_model(
+            return self.instrumented_model(
                 input_ids=present_input_ids,
                 attention_mask=present_attention_mask,
                 use_cache=False,
@@ -487,13 +495,13 @@ class QwenImmAdapter(nn.Module):
         T_p = present_input_ids.size(1)
 
         # --- extract Qwen internals -----------------------------------------
-        qwen: nn.Module = self.original_model.model        # Qwen2Model
+        qwen: nn.Module = self.instrumented_model.model        # Qwen2Model
         embed_tokens = qwen.embed_tokens
         all_layers: nn.ModuleList = qwen.layers         # some are wrappers
         final_norm = qwen.norm
         rotary_emb = qwen.rotary_emb
-        lm_head = self.original_model.lm_head
-        config = self.original_model.config
+        lm_head = self.instrumented_model.lm_head
+        config = self.instrumented_model.config
 
         # --- embed -----------------------------------------------------------
         hist_ids_flat = history_input_ids.reshape(B_H, T_h)
@@ -626,21 +634,26 @@ class QwenImmAdapter(nn.Module):
     # ---- generation / PEFT compatibility ------------------------------------
 
     def prepare_inputs_for_generation(self, *args, **kwargs):
-        if not hasattr(self.original_model, "prepare_inputs_for_generation"):
-            raise AttributeError("original_model does not provide prepare_inputs_for_generation().")
-        return self.original_model.prepare_inputs_for_generation(*args, **kwargs)
+        if not hasattr(self.instrumented_model, "prepare_inputs_for_generation"):
+            raise AttributeError(
+                "instrumented_model does not provide prepare_inputs_for_generation()."
+            )
+        return self.instrumented_model.prepare_inputs_for_generation(*args, **kwargs)
 
     def _prepare_encoder_decoder_kwargs_for_generation(self, *args, **kwargs):
-        if not hasattr(self.original_model, "_prepare_encoder_decoder_kwargs_for_generation"):
+        if not hasattr(self.instrumented_model, "_prepare_encoder_decoder_kwargs_for_generation"):
             raise AttributeError(
-                "original_model does not provide _prepare_encoder_decoder_kwargs_for_generation()."
+                "instrumented_model does not provide "
+                "_prepare_encoder_decoder_kwargs_for_generation()."
             )
-        return self.original_model._prepare_encoder_decoder_kwargs_for_generation(*args, **kwargs)
+        return self.instrumented_model._prepare_encoder_decoder_kwargs_for_generation(
+            *args, **kwargs
+        )
 
     def generate(self, *args, **kwargs):
-        if not hasattr(self.original_model, "generate"):
-            raise AttributeError("original_model does not provide generate().")
-        return self.original_model.generate(*args, **kwargs)
+        if not hasattr(self.instrumented_model, "generate"):
+            raise AttributeError("instrumented_model does not provide generate().")
+        return self.instrumented_model.generate(*args, **kwargs)
 
     # ---- utilities ----------------------------------------------------------
 
