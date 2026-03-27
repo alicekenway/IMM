@@ -90,6 +90,28 @@ def mark_imm_parameters_trainable(model: torch.nn.Module) -> None:
             parameter.requires_grad = True
 
 
+def align_imm_module_dtype_with_backbone(
+    wrapped_model: torch.nn.Module,
+    backbone_model: torch.nn.Module,
+) -> None:
+    """Cast newly created IMM modules to the backbone parameter dtype/device.
+
+    The base HF model may be loaded in bf16/fp16, while IMM modules are created
+    with PyTorch defaults (typically fp32). That mismatch can remain hidden in
+    training under autocast, but it breaks generation/inference paths where a
+    bf16 hidden state is projected by fp32 IMM weights.
+    """
+    reference_param = next(backbone_model.parameters(), None)
+    if reference_param is None:
+        return
+
+    target_device = reference_param.device
+    target_dtype = reference_param.dtype
+    for module_name, module in wrapped_model.named_modules():
+        if "imm_module" in module_name:
+            module.to(device=target_device, dtype=target_dtype)
+
+
 def build_model_with_imm(project_config: ImmQwenProjectConfig) -> TrainBuildArtifacts:
     tokenizer = build_tokenizer(project_config)
     original_model = build_original_causal_lm_model(project_config)
@@ -107,6 +129,7 @@ def build_model_with_imm(project_config: ImmQwenProjectConfig) -> TrainBuildArti
         value_dim=project_config.memory_dimensions.value_dim,
         summary_config=project_config.turn_summary,
     )
+    align_imm_module_dtype_with_backbone(wrapped_model, original_model)
     wrapped_model = attach_lora_to_qwen(wrapped_model, project_config)
     mark_imm_parameters_trainable(wrapped_model)
     data_collator = ImmDataCollator(tokenizer)
