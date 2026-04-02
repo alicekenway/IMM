@@ -1,0 +1,119 @@
+# =============================================================================
+# IMM-Qwen Batch Inference Configuration
+# =============================================================================
+# Usage:
+#   python -m imm_qwen.batch_infer --config inference_config.yaml
+
+# ---------------------------------------------------------------------------
+# Model
+# ---------------------------------------------------------------------------
+# Base model (same one used during training).
+model_name_or_path: "Qwen/Qwen2.5-0.5B"
+
+# Path to the trained checkpoint directory (output of training).
+# Should contain: lora_adapter/, imm_modules.pt, tokenizer/ (optional).
+# Leave empty or omit to run with base (untrained) weights.
+checkpoint_dir: "outputs/imm_qwen/final"
+
+# Weight dtype when loading the base model: bf16, fp16, fp32.
+torch_dtype: "bf16"
+
+# Enable only for model repos requiring custom Python code.
+trust_remote_code: false
+
+# Device: "auto" picks CUDA if available, else CPU.
+# Also accepts "cuda", "cuda:0", "cpu", etc.
+device: "auto"
+
+# ---------------------------------------------------------------------------
+# IMM Architecture (must match training config)
+# ---------------------------------------------------------------------------
+memory_dimensions:
+  hidden_dim: 896
+  key_dim: 192
+  value_dim: 192
+
+memory_slots:
+  session_slots: 64
+  working_slots: 16
+
+turn_summary:
+  pooling_strategy: "last_token"
+  use_layer_norm: true
+
+controller:
+  session_merge_gate: 1.0
+  use_working_memory: false
+  working_merge_gate: 1.0
+
+placement:
+  enable_imm: true
+  top_fraction: 0.5
+
+lora:
+  enabled: true
+  rank: 8
+  alpha: 16
+  dropout: 0.0       # always 0 for inference (overridden internally)
+  target_modules:
+    - "q_proj"
+    - "k_proj"
+    - "v_proj"
+    - "o_proj"
+    - "gate_proj"
+    - "up_proj"
+    - "down_proj"
+  bias: "none"
+  task_type: "CAUSAL_LM"
+
+# ---------------------------------------------------------------------------
+# Data
+# ---------------------------------------------------------------------------
+# Input JSON file — same format as training data (with optional history).
+data_path: "../sample_expanded_conversation_dedupe.json"
+
+# Output JSON file — mirrors input with an added "inference_output" field.
+output_path: "outputs/inference_results.json"
+
+# Maximum token length for each history line during memory prefill.
+max_history_line_length: 256
+
+# ---------------------------------------------------------------------------
+# Generation
+# ---------------------------------------------------------------------------
+generation:
+  # Strategy: "greedy" | "beam" | "sample"
+  strategy: "greedy"
+
+  # Temperature for sampling (only used when strategy is "sample").
+  temperature: 0.7
+
+  # Nucleus sampling threshold (only used when strategy is "sample").
+  top_p: 0.9
+
+  # Top-k filtering (only used when strategy is "sample").
+  top_k: 50
+
+  # Number of beams (only used when strategy is "beam").
+  num_beams: 4
+
+  # Length penalty for beam search (>1.0 favors longer, <1.0 favors shorter).
+  length_penalty: 1.0
+
+  # Penalize repeated tokens (1.0 = no penalty).
+  repetition_penalty: 1.0
+
+  # Maximum number of new tokens to generate per sample.
+  max_new_tokens: 128
+
+  # Block repeated n-grams of this size (0 = disabled).
+  no_repeat_ngram_size: 0
+
+# ---------------------------------------------------------------------------
+# Misc
+# ---------------------------------------------------------------------------
+# Random seed for reproducibility (affects sampling).
+seed: 42
+
+# Print progress every N samples (0 = silent).
+log_every: 10

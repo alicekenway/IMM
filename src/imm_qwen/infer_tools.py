@@ -6,6 +6,7 @@ import torch
 
 from .config import InferenceToolConfig
 from .controller import RuleBasedMemoryController
+from .data_llamafactory import SupervisedRecord, build_present_turn_prompt_text
 from .modeling_imm import QwenImmAdapter, QwenImmLayerWrapper
 
 
@@ -146,18 +147,47 @@ class InferenceEngine:
                 do_sample=not self.options.deterministic,
             )
 
-        generated_text = self.tokenizer.decode(generated[0], skip_special_tokens=True)
-        response_text = generated_text[len(prompt_text):].strip()
-
-        # Write the completed turn into per-layer memory.
-        self._write_turn_to_session(adapter, record, input_ids, attention_mask, device)
+        response_tokens = generated[0, input_ids.size(1):]
+        response_text = self.tokenizer.decode(
+            response_tokens,
+            skip_special_tokens=True,
+        ).strip()
+        # Write the completed turn into per-layer memory using the same
+        # line-level format as training history prefill.
+        self._write_turn_to_session(
+            adapter,
+            record,
+            history_lines=self._build_history_lines(
+                user_text=user_text,
+                assistant_text=response_text,
+            ),
+            device=device,
+        )
         record.turn_index += 1
 
         adapter.set_passthrough_mode()
         return response_text
 
     def _build_prompt(self, user_text: str) -> str:
-        return f"User: {user_text}\nAssistant:"
+        return build_present_turn_prompt_text(
+            SupervisedRecord(
+                instruction="",
+                input=user_text,
+                output="",
+                system="",
+            )
+        )
+
+    @staticmethod
+    def _build_history_lines(user_text: str, assistant_text: str) -> List[str]:
+        history_lines: List[str] = []
+        user_text = user_text.strip()
+        assistant_text = assistant_text.strip()
+        if user_text:
+            history_lines.append(f"User: {user_text}")
+        if assistant_text:
+            history_lines.append(f"Assistant: {assistant_text}")
+        return history_lines
 
     def _load_session_memory_to_wrappers(
         self,
@@ -178,37 +208,43 @@ class InferenceEngine:
         self,
         adapter: QwenImmAdapter,
         record: SessionRecord,
-        input_ids: torch.Tensor,
-        attention_mask: torch.Tensor,
+        history_lines: List[str],
         device: torch.device,
     ) -> None:
-        """Run the completed turn through the backbone in history_collect mode
-        to produce K,V for each IMM layer, then persist them."""
+        """Write the completed turn into session memory as history lines."""
+        if not history_lines:
+            return
+
         # Temporarily clear and use collect mode to capture this turn's K,V.
         # Save existing slots first.
         saved_keys = [list(w._collected_keys) for w in adapter.wrapped_layers]
         saved_values = [list(w._collected_values) for w in adapter.wrapped_layers]
         saved_valid = [list(w._collected_valid) for w in adapter.wrapped_layers]
 
-        for wrapper in adapter.wrapped_layers:
-            wrapper.clear_memory_slots()
+        for line_text in history_lines:
+            line_inputs = self.tokenizer(line_text, return_tensors="pt")
+            input_ids = line_inputs["input_ids"].to(device)
+            attention_mask = line_inputs["attention_mask"].to(device)
 
-        adapter.set_history_collect_mode(attention_mask=attention_mask)
+            for wrapper in adapter.wrapped_layers:
+                wrapper.clear_memory_slots()
 
-        with torch.no_grad():
-            self.model(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                use_cache=False,
-            )
+            adapter.set_history_collect_mode(attention_mask=attention_mask)
 
-        # Extract the newly collected K,V and persist to session banks.
-        for wrapper, bank in zip(adapter.wrapped_layers, record.layer_banks):
-            if wrapper._collected_keys:
-                bank.append(
-                    key=wrapper._collected_keys[0],
-                    value=wrapper._collected_values[0],
+            with torch.no_grad():
+                self.model(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    use_cache=False,
                 )
+
+            # Extract the newly collected K,V and persist to session banks.
+            for wrapper, bank in zip(adapter.wrapped_layers, record.layer_banks):
+                if wrapper._collected_keys:
+                    bank.append(
+                        key=wrapper._collected_keys[0],
+                        value=wrapper._collected_values[0],
+                    )
 
         # Restore the previous slots.
         for wrapper, keys, values, valid in zip(
