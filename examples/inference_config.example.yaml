@@ -7,6 +7,11 @@
 # ---------------------------------------------------------------------------
 # Model
 # ---------------------------------------------------------------------------
+# Set to false to ignore history during inference.
+# The same trained model is loaded, but each sample runs as single-turn
+# inference without IMM history prefill.
+use_imm: true
+
 # Base model (same one used during training).
 model_name_or_path: "Qwen/Qwen2.5-0.5B"
 

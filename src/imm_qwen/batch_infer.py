@@ -66,6 +66,7 @@ class GenerationConfig:
 class InferConfig:
     """Top-level config for inference, parsed from YAML."""
     # Model
+    use_imm: bool = True                # False = ignore history prefill and run single-turn inference with the same trained model
     model_name_or_path: str = ""
     checkpoint_dir: str = ""            # dir saved by train (contains lora_adapter/, imm_modules.pt, tokenizer/)
     torch_dtype: str = "bf16"
@@ -121,6 +122,7 @@ def load_infer_config(yaml_path: str) -> Tuple[InferConfig, GenerationConfig]:
 
     defaults = InferConfig()
     cfg = InferConfig(
+        use_imm=raw.get("use_imm", defaults.use_imm),
         model_name_or_path=raw.get("model_name_or_path", defaults.model_name_or_path),
         checkpoint_dir=raw.get("checkpoint_dir", defaults.checkpoint_dir),
         torch_dtype=raw.get("torch_dtype", defaults.torch_dtype),
@@ -377,6 +379,9 @@ def run_inference(yaml_path: str) -> None:
     model.eval()
     adapter = resolve_imm_adapter(model)
 
+    if not cfg.use_imm:
+        logger.info("use_imm=False — history will be ignored (single-turn inference)")
+
     # Build generation kwargs
     gen_kwargs = build_generation_kwargs(gen)
     logger.info("Generation config: strategy=%s %s", gen.strategy, gen_kwargs)
@@ -399,7 +404,7 @@ def run_inference(yaml_path: str) -> None:
             input=str(row.get("input", "")),
             output=str(row.get("output", "")),
             system=str(row.get("system", "")),
-            history=row.get("history"),
+            history=row.get("history") if cfg.use_imm else None,
         )
 
         response = run_single(
