@@ -10,7 +10,6 @@ from .interfaces import MemoryScope, StepContext
 @dataclass(frozen=True)
 class ControllerRuntimeFlags:
     force_disable_session_read: bool = False
-    force_disable_working_read: bool = False
 
 
 class RuleBasedMemoryController:
@@ -54,11 +53,6 @@ class RuleBasedMemoryController:
                 return False
             return True
 
-        if scope == "working":
-            if self.runtime_flags.force_disable_working_read:
-                return False
-            return bool(self.config.use_working_memory)
-
         raise ValueError(f"unknown memory scope: {scope}")
 
     def should_write_memory(self, step_context: StepContext) -> bool:
@@ -79,14 +73,4 @@ class RuleBasedMemoryController:
                 return retrieved_states * gate * allowed_mask
             return retrieved_states * gate
 
-        if scope == "working":
-            if not self.config.use_working_memory:
-                return torch.zeros_like(retrieved_states)
-            gate = self.config.working_merge_gate
-            if history_lookup_mask is not None:
-                allowed_mask = (~history_lookup_mask).unsqueeze(-1).to(retrieved_states.dtype)
-                return retrieved_states * gate * allowed_mask
-            return retrieved_states * gate
-
         raise ValueError(f"unknown memory scope: {scope}")
-

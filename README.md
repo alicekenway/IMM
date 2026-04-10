@@ -2,7 +2,7 @@
 
 This package implements an IMM-oriented trainer/runtime for Qwen 2/3 with:
 
-- two memory scopes (`working`, `session`)
+- session memory scope for long-term turn-level memory
 - mask-based history lookup routing
 - turn-level compressed memory writes
 - LoRA integration for Qwen modules
@@ -118,9 +118,7 @@ This project keeps the Hugging Face Qwen model mostly intact and injects IMM by 
   - **`QwenImmAdapter`** (`imm_qwen/modeling_imm.py`): owns the base model and replaces some decoder layers with IMM-enabled wrappers.
   - **`QwenImmLayerWrapper`**: wraps one decoder layer; runs the original layer first, then applies IMM to its output hidden states.
   - **`ImplicitMemoryModule` (IMM core)**: does “read → gated merge” during forward; does “turn summary → write” when requested.
-  - **`MultiScopeMemoryState`** (`imm_qwen/memory_state.py`): two memory banks per sample:
-    - **`session`**: long-term turn-level memory (history/past turns)
-    - **`working`**: short-term scratch memory (optional; often disabled for efficiency)
+  - **`SessionMemoryState`** (`imm_qwen/memory_state.py`): session memory bank per sample for long-term turn-level memory (history/past turns)
   - **`RuleBasedMemoryController`** (`imm_qwen/controller.py`): applies deterministic gates and enforces the `history_lookup_mask` rule.
 
 - **Layer placement**
@@ -134,23 +132,21 @@ This project keeps the Hugging Face Qwen model mostly intact and injects IMM by 
 
   1. Run the original Qwen decoder layer to get `hidden_states` \([B, T, H]\).
   2. IMM computes a query per token: `query = query_proj(hidden_states)` \([B, T, key_dim]\).
-  3. IMM reads memory:
-     - `session` read is conditioned by `history_lookup_mask`.
-     - `working` read happens only if `controller.use_working_memory: true`.
+  3. IMM reads session memory, conditioned by `history_lookup_mask`.
   4. Controller applies **gated merge**:
-     - A scalar gate (`session_merge_gate` / `working_merge_gate`) scales retrieved vectors.
+     - A scalar gate (`session_merge_gate`) scales retrieved vectors.
      - `history_lookup_mask` blocks history usage at masked tokens:
        - `True`  ⇒ masked ⇒ do **not** merge retrieved memory at that token
        - `False` ⇒ allowed ⇒ merge retrieved memory at that token
   5. Retrieved values are projected back to hidden size and added as a residual:
-     - `hidden_out = LayerNorm(hidden_states + output_proj(working + session))`
+     - `hidden_out = LayerNorm(hidden_states + output_proj(session))`
 
   You can think of the per-layer structure like this:
 
   ```text
   tokens → [Qwen decoder layer] → hidden_states
                                  │
-                                 ├─ IMM read: query_proj → memory_state.read(session/working)
+                                 ├─ IMM read: query_proj → memory_state.read(session)
                                  ├─ IMM gate: controller.merge_gate (+ history_lookup_mask)
                                  └─ IMM merge: output_proj + residual + LayerNorm → hidden_out
   ```

@@ -33,11 +33,9 @@ class FifoReplacementPolicy(ReplacementPolicyProtocol):
         return write_pointer
 
 
-class MultiScopeMemoryState:
+class SessionMemoryState:
     """
-    Runtime memory state with two scopes:
-      - working memory
-      - session memory
+    Runtime memory state with session scope.
 
     Design goals:
       - pre-allocated bank tensors
@@ -49,20 +47,17 @@ class MultiScopeMemoryState:
         self,
         key_dim: int,
         value_dim: int,
-        working_slots: int,
         session_slots: int,
         replacement_policy: Optional[ReplacementPolicyProtocol] = None,
     ) -> None:
         self.key_dim = key_dim
         self.value_dim = value_dim
-        self.working_slots = working_slots
         self.session_slots = session_slots
         self.replacement_policy = replacement_policy or FifoReplacementPolicy()
         self.device = torch.device("cpu")
         self.dtype = torch.float32
 
         self.batch_size = 0
-        self.working_bank: Optional[MemoryBankTensors] = None
         self.session_bank: Optional[MemoryBankTensors] = None
 
     def ensure_batch_size(
@@ -75,7 +70,6 @@ class MultiScopeMemoryState:
             self.batch_size == batch_size
             and self.device == device
             and self.dtype == dtype
-            and self.working_bank is not None
             and self.session_bank is not None
         ):
             return
@@ -83,23 +77,12 @@ class MultiScopeMemoryState:
         self.batch_size = batch_size
         self.device = device
         self.dtype = dtype
-        self.working_bank = self._create_bank(
-            batch_size=batch_size,
-            num_slots=self.working_slots,
-            device=device,
-            dtype=dtype,
-        )
         self.session_bank = self._create_bank(
             batch_size=batch_size,
             num_slots=self.session_slots,
             device=device,
             dtype=dtype,
         )
-
-    def reset_working(self) -> None:
-        if self.working_bank is None:
-            return
-        self._reset_bank(self.working_bank)
 
     def reset_session(self) -> None:
         if self.session_bank is None:
@@ -163,9 +146,7 @@ class MultiScopeMemoryState:
             "batch_size": self.batch_size,
             "key_dim": self.key_dim,
             "value_dim": self.value_dim,
-            "working_slots": self.working_slots,
             "session_slots": self.session_slots,
-            "working_bank": self._bank_to_state(self.working_bank),
             "session_bank": self._bank_to_state(self.session_bank),
         }
 
@@ -173,24 +154,16 @@ class MultiScopeMemoryState:
         self.batch_size = int(state_dict["batch_size"])
         self.key_dim = int(state_dict["key_dim"])
         self.value_dim = int(state_dict["value_dim"])
-        self.working_slots = int(state_dict["working_slots"])
         self.session_slots = int(state_dict["session_slots"])
 
-        working_state = state_dict["working_bank"]
         session_state = state_dict["session_bank"]
-        if working_state is not None:
-            self.working_bank = self._state_to_bank(working_state)
         if session_state is not None:
             self.session_bank = self._state_to_bank(session_state)
-        if self.working_bank is not None:
-            self.device = self.working_bank.keys.device
-            self.dtype = self.working_bank.keys.dtype
+        if self.session_bank is not None:
+            self.device = self.session_bank.keys.device
+            self.dtype = self.session_bank.keys.dtype
 
     def _get_bank(self, scope: MemoryScope) -> MemoryBankTensors:
-        if scope == "working":
-            if self.working_bank is None:
-                raise RuntimeError("working memory bank is not initialized.")
-            return self.working_bank
         if scope == "session":
             if self.session_bank is None:
                 raise RuntimeError("session memory bank is not initialized.")
@@ -268,4 +241,3 @@ class MultiScopeMemoryState:
             turn_index=state["turn_index"],
             retention_score=state["retention_score"],
         )
-

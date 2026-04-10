@@ -13,7 +13,7 @@ from .config import (
 )
 from .controller import RuleBasedMemoryController
 from .infer_tools import InferenceEngine, SessionManager
-from .memory_state import FifoReplacementPolicy, MultiScopeMemoryState
+from .memory_state import FifoReplacementPolicy, SessionMemoryState
 from .modeling_imm import ImplicitMemoryModule, QwenImmAdapter, QwenImmLayerWrapper
 from .train_tools import (
     TrainBuildArtifacts,
@@ -37,7 +37,7 @@ __all__ = [
     "MemoryDimensionsConfig",
     "MemorySlotsConfig",
     "ModelBuildConfig",
-    "MultiScopeMemoryState",
+    "SessionMemoryState",
     "QwenImmAdapter",
     "QwenImmLayerWrapper",
     "RuleBasedMemoryController",

@@ -75,16 +75,16 @@ class InferConfig:
 
     # IMM architecture (must match training config)
     memory_dimensions: Dict[str, Any] = field(default_factory=lambda: {
-        "hidden_dim": 896, "key_dim": 192, "value_dim": 192,
+        "key_dim": 192, "value_dim": 192,
     })
     memory_slots: Dict[str, Any] = field(default_factory=lambda: {
-        "session_slots": 64, "working_slots": 16,
+        "session_slots": 64,
     })
     turn_summary: Dict[str, Any] = field(default_factory=lambda: {
         "pooling_strategy": "last_token", "use_layer_norm": True,
     })
     controller: Dict[str, Any] = field(default_factory=lambda: {
-        "session_merge_gate": 1.0, "use_working_memory": False, "working_merge_gate": 1.0,
+        "session_merge_gate": 1.0,
     })
     placement: Dict[str, Any] = field(default_factory=lambda: {
         "enable_imm": True, "top_fraction": 0.5,

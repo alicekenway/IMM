@@ -4,7 +4,6 @@ from typing import Optional, Tuple
 
 @dataclass(frozen=True)
 class MemoryDimensionsConfig:
-    hidden_dim: int
     key_dim: int
     value_dim: int
 
@@ -12,7 +11,6 @@ class MemoryDimensionsConfig:
 @dataclass(frozen=True)
 class MemorySlotsConfig:
     session_slots: int = 64
-    working_slots: int = 16
 
 
 @dataclass(frozen=True)
@@ -26,9 +24,6 @@ class TurnSummaryConfig:
 class MemoryControllerConfig:
     # Session memory is long-term turn memory.
     session_merge_gate: float = 1.0
-    # Working memory can be disabled for efficiency-focused training.
-    use_working_memory: bool = False
-    working_merge_gate: float = 1.0
 
 
 @dataclass(frozen=True)
@@ -110,7 +105,6 @@ class TrainingToolConfig:
 @dataclass(frozen=True)
 class InferenceToolConfig:
     memory_enabled: bool = True
-    reset_working_memory_per_turn: bool = True
     reset_session_memory_on_new_dialog: bool = False
     deterministic: bool = False
 

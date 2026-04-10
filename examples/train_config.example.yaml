@@ -7,9 +7,6 @@ model:
   trust_remote_code: false
 
 memory_dimensions:
-  # Documented IMM input hidden size. It should match the model hidden size.
-  # Note: the current trainer derives the actual hidden size from the loaded model.
-  hidden_dim: 896
   # Size of the memory key vectors used for memory lookup.
   key_dim: 192
   # Size of the memory value vectors retrieved and merged back into the model.
@@ -18,8 +15,6 @@ memory_dimensions:
 memory_slots:
   # Number of long-term session-memory entries kept per sample.
   session_slots: 64
-  # Number of short-term working-memory entries kept per sample.
-  working_slots: 16
 
 turn_summary:
   # How one full turn is compressed before writing it into memory.
@@ -32,11 +27,6 @@ controller:
   # Strength of the retrieved session-memory contribution during merge.
   # 0.0 disables the session-memory effect; 1.0 keeps full strength.
   session_merge_gate: 1.0
-  # Whether to read and write the short-term working-memory bank.
-  # Disable for a simpler and cheaper session-memory-only setup.
-  use_working_memory: false
-  # Strength of the retrieved working-memory contribution during merge.
-  working_merge_gate: 1.0
 
 placement:
   # Master switch for inserting IMM modules into the transformer.

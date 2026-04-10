@@ -4,7 +4,7 @@ from typing import Any, Dict, Literal, Optional, Protocol, Tuple
 import torch
 
 
-MemoryScope = Literal["working", "session"]
+MemoryScope = Literal["session"]
 
 
 @dataclass(frozen=True)
@@ -60,9 +60,6 @@ class ReplacementPolicyProtocol(Protocol):
 
 class MemoryStateProtocol(Protocol):
     device: torch.device
-
-    def reset_working(self) -> None:
-        ...
 
     def reset_session(self) -> None:
         ...

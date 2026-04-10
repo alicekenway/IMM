@@ -34,13 +34,11 @@ device: "auto"
 # IMM Architecture (must match training config)
 # ---------------------------------------------------------------------------
 memory_dimensions:
-  hidden_dim: 896
   key_dim: 192
   value_dim: 192
 
 memory_slots:
   session_slots: 64
-  working_slots: 16
 
 turn_summary:
   pooling_strategy: "last_token"
@@ -48,8 +46,6 @@ turn_summary:
 
 controller:
   session_merge_gate: 1.0
-  use_working_memory: false
-  working_merge_gate: 1.0
 
 placement:
   enable_imm: true

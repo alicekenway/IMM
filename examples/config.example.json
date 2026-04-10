@@ -5,7 +5,6 @@
     "trust_remote_code": false
   },
   "memory_dimensions": {
-    "hidden_dim": 896,
     "key_dim": 192,
     "value_dim": 192
   }
