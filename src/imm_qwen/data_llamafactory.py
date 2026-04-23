@@ -240,7 +240,12 @@ class ImmDataCollator:
 
         # History lines are padded into [B, H, T_hist] to support batched
         # memory prefill without per-sample Python loops in the train step.
-        max_history_lines = max((len(lines) for lines in history_line_input_ids_batch), default=0)
+        # Keep at least one padded history slot so multi-GPU training does not
+        # bypass IMM entirely on ranks whose local microbatch has no history.
+        max_history_lines = max(
+            1,
+            max((len(lines) for lines in history_line_input_ids_batch), default=0),
+        )
         max_history_length = 1
         for line_list in history_line_input_ids_batch:
             for line_ids in line_list:

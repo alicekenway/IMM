@@ -482,8 +482,13 @@ class QwenImmAdapter(nn.Module):
         B, H, T_h = history_input_ids.shape
         device = present_input_ids.device
 
-        # --- fast path: no history -------------------------------------------
-        if H == 0 or not history_line_mask.any():
+        # --- fast path: truly no history tensor -------------------------------
+        # When a rank receives a microbatch whose samples all have empty
+        # history, the collator still provides one padded history slot with a
+        # fully-false ``history_line_mask``. That keeps IMM parameters in the
+        # autograd graph on every rank, which avoids DDP unused-parameter
+        # failures under multi-GPU training.
+        if H == 0:
             return self.instrumented_model(
                 input_ids=present_input_ids,
                 attention_mask=present_attention_mask,
