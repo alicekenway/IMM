@@ -127,7 +127,7 @@ class DummyDistributedWrapper(torch.nn.Module):
         self.module = module
 
     def forward(self, *args, **kwargs):
-        return self.module(*args, **kwargs)
+        raise AssertionError("run_validation should use the unwrapped model, not the DDP wrapper")
 
 
 class DummyValidationTokenizer:

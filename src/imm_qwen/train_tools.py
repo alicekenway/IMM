@@ -582,7 +582,7 @@ def run_validation(
     with torch.no_grad():
         for batch in val_dataloader:
             batch = _move_batch_to_device(batch, device)
-            outputs = model(
+            outputs = eval_model(
                 input_ids=batch["input_ids"],
                 attention_mask=batch["attention_mask"],
                 history_input_ids=batch["history_input_ids"],
