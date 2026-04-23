@@ -1,6 +1,7 @@
 import torch
 
 from imm_qwen.controller import RuleBasedMemoryController
+from imm_qwen.config import TurnSummaryConfig
 from imm_qwen.modeling_imm import ImplicitMemoryModule
 
 
@@ -102,3 +103,24 @@ def test_write_projections_get_gradients() -> None:
     assert module.output_proj.weight.grad is not None
     assert module.write_key_proj.weight.grad.abs().sum() > 0
     assert module.write_value_proj.weight.grad.abs().sum() > 0
+
+
+def test_summary_pooling_logits_frozen_when_attention_pool_disabled() -> None:
+    controller = RuleBasedMemoryController()
+    last_token_module = ImplicitMemoryModule(
+        hidden_dim=12,
+        key_dim=6,
+        value_dim=6,
+        controller=controller,
+        summary_config=TurnSummaryConfig(pooling_strategy="last_token"),
+    )
+    attention_pool_module = ImplicitMemoryModule(
+        hidden_dim=12,
+        key_dim=6,
+        value_dim=6,
+        controller=controller,
+        summary_config=TurnSummaryConfig(pooling_strategy="attention_pool"),
+    )
+
+    assert last_token_module.summary_compressor.summary_pooling_logits.weight.requires_grad is False
+    assert attention_pool_module.summary_compressor.summary_pooling_logits.weight.requires_grad is True

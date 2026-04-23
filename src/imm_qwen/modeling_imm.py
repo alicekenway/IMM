@@ -33,6 +33,11 @@ class TurnSummaryCompressor(nn.Module):
         super().__init__()
         self.summary_config = summary_config or TurnSummaryConfig()
         self.summary_pooling_logits = nn.Linear(hidden_dim, 1, bias=False)
+        if self.summary_config.pooling_strategy != "attention_pool":
+            # This projection only participates in attention-based pooling.
+            # Keep the module for checkpoint compatibility but exclude it from
+            # training/DDP when another pooling mode is selected.
+            self.summary_pooling_logits.weight.requires_grad_(False)
         self.output_norm = (
             nn.LayerNorm(hidden_dim)
             if self.summary_config.use_layer_norm

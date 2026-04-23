@@ -127,9 +127,11 @@ def main() -> None:
     # Resolve checkpoint resume path (CLI --resume overrides config)
     resume_dir = args.resume or training_config.resume_from_checkpoint
 
-    # All IMM parameters are used inside dual_stream_forward (called from
-    # the DDP-tracked forward), so find_unused_parameters is not needed.
-    ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=False)
+    # The manual dual-stream path is data-dependent under multi-GPU training
+    # (for example empty-history batches or disabled summary-pooling branches),
+    # so DDP must track unused parameters safely instead of assuming a fully
+    # static graph.
+    ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
     accelerator = Accelerator(
         gradient_accumulation_steps=training_config.grad_accum_steps,
         kwargs_handlers=[ddp_kwargs],
