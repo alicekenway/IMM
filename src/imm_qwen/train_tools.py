@@ -536,6 +536,14 @@ def _move_batch_to_device(
     return {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
 
 
+def _unwrap_distributed_model(model: torch.nn.Module) -> torch.nn.Module:
+    """Unwrap DDP-style containers for eval/generation-only code paths."""
+    unwrapped = model
+    while hasattr(unwrapped, "module"):
+        unwrapped = unwrapped.module
+    return unwrapped
+
+
 def run_validation(
     model: torch.nn.Module,
     val_dataloader: DataLoader,
@@ -559,7 +567,8 @@ def run_validation(
     Returns the average loss across all samples.
     """
     model.eval()
-    adapter = resolve_imm_adapter(model)
+    eval_model = _unwrap_distributed_model(model)
+    adapter = resolve_imm_adapter(eval_model)
 
     total_weighted_loss: float = 0.0
     total_tokens: int = 0
@@ -620,7 +629,7 @@ def run_validation(
             # 1. Clear memory and prefill history for this batch
             adapter.clear_all_memory_slots()
             _prefill_history_for_generation(
-                model=model,
+                model=eval_model,
                 adapter=adapter,
                 history_input_ids=batch["history_input_ids"],
                 history_attention_mask=batch["history_attention_mask"],
@@ -644,7 +653,7 @@ def run_validation(
             )
 
             # 4. Batched generate
-            generated = model.generate(
+            generated = eval_model.generate(
                 input_ids=prompt_ids,
                 attention_mask=prompt_mask,
                 pad_token_id=pad_token_id,
