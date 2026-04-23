@@ -179,7 +179,8 @@ def build_optimizer_groups(
     model: torch.nn.Module,
     lora_lr: float,
     imm_lr: float,
-    weight_decay: float,
+    lora_weight_decay: float,
+    imm_weight_decay: float,
 ) -> List[Dict[str, Any]]:
     lora_params: List[torch.nn.Parameter] = []
     imm_params: List[torch.nn.Parameter] = []
@@ -197,14 +198,40 @@ def build_optimizer_groups(
 
     groups: List[Dict[str, Any]] = []
     if lora_params:
-        groups.append({"params": lora_params, "lr": lora_lr, "weight_decay": weight_decay})
+        groups.append(
+            {"params": lora_params, "lr": lora_lr, "weight_decay": lora_weight_decay}
+        )
     if imm_params:
-        groups.append({"params": imm_params, "lr": imm_lr, "weight_decay": weight_decay})
+        groups.append(
+            {"params": imm_params, "lr": imm_lr, "weight_decay": imm_weight_decay}
+        )
     if other_trainable_params:
         groups.append(
-            {"params": other_trainable_params, "lr": imm_lr, "weight_decay": weight_decay}
+            {
+                "params": other_trainable_params,
+                "lr": imm_lr,
+                "weight_decay": imm_weight_decay,
+            }
         )
     return groups
+
+
+def build_constant_lr_with_warmup_scheduler(
+    optimizer: torch.optim.Optimizer,
+    num_warmup_steps: int,
+) -> torch.optim.lr_scheduler.LambdaLR:
+    """Linearly warm LR for all groups, then keep each group's base LR constant."""
+    if num_warmup_steps < 0:
+        raise ValueError("num_warmup_steps must be non-negative.")
+
+    def lr_lambda(current_step: int) -> float:
+        if num_warmup_steps == 0:
+            return 1.0
+        if current_step < num_warmup_steps:
+            return float(current_step) / float(max(1, num_warmup_steps))
+        return 1.0
+
+    return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambda)
 
 
 def _collect_imm_state_dict(model: torch.nn.Module) -> Dict[str, torch.Tensor]:
@@ -236,6 +263,7 @@ def save_checkpoint(
     checkpoint_dir: str,
     model: torch.nn.Module,
     optimizer: torch.optim.Optimizer,
+    scheduler: Optional[torch.optim.lr_scheduler.LRScheduler],
     tokenizer: Any,
     epoch: int,
     global_step: int,
@@ -261,6 +289,9 @@ def save_checkpoint(
 
     # Save optimizer state
     torch.save(optimizer.state_dict(), (ckpt_path / "optimizer.pt").as_posix())
+
+    if scheduler is not None:
+        torch.save(scheduler.state_dict(), (ckpt_path / "scheduler.pt").as_posix())
 
     # Save tokenizer
     tokenizer_dir = ckpt_path / "tokenizer"
@@ -342,6 +373,18 @@ def load_optimizer_state(checkpoint_dir: str, optimizer: torch.optim.Optimizer) 
     if opt_file.exists():
         optimizer.load_state_dict(
             torch.load(opt_file.as_posix(), map_location="cpu", weights_only=True)
+        )
+
+
+def load_scheduler_state(
+    checkpoint_dir: str,
+    scheduler: torch.optim.lr_scheduler.LRScheduler,
+) -> None:
+    """Load LR scheduler state dict from a checkpoint when available."""
+    scheduler_file = Path(checkpoint_dir) / "scheduler.pt"
+    if scheduler_file.exists():
+        scheduler.load_state_dict(
+            torch.load(scheduler_file.as_posix(), map_location="cpu", weights_only=True)
         )
 
 

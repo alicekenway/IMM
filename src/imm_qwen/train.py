@@ -1,7 +1,7 @@
 import argparse
+import math
 import random
 import time
-from dataclasses import asdict
 from pathlib import Path
 from typing import Any, Dict, Tuple
 
@@ -24,11 +24,13 @@ from .config import (
 )
 from .data_llamafactory import ImmSupervisedDataset
 from .train_tools import (
+    build_constant_lr_with_warmup_scheduler,
     build_loss_bundle,
     build_model_with_imm,
     build_optimizer_groups,
     load_checkpoint,
     load_optimizer_state,
+    load_scheduler_state,
     resolve_imm_adapter,
     run_validation,
     save_checkpoint,
@@ -195,18 +197,29 @@ def main() -> None:
         model=artifacts.model,
         lora_lr=training_config.learning_rate_lora,
         imm_lr=training_config.learning_rate_imm,
-        weight_decay=training_config.weight_decay,
+        lora_weight_decay=training_config.weight_decay_lora,
+        imm_weight_decay=training_config.weight_decay_imm,
     )
     optimizer = torch.optim.AdamW(optimizer_groups)
+    update_steps_per_epoch = math.ceil(
+        len(train_dataloader) / max(1, training_config.grad_accum_steps)
+    )
+    total_update_steps = update_steps_per_epoch * training_config.num_epochs
+    warmup_steps = math.ceil(total_update_steps * training_config.warmup_ratio)
+    lr_scheduler = build_constant_lr_with_warmup_scheduler(
+        optimizer=optimizer,
+        num_warmup_steps=warmup_steps,
+    )
 
-    model, optimizer, train_dataloader = accelerator.prepare(
-        artifacts.model, optimizer, train_dataloader
+    model, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
+        artifacts.model, optimizer, train_dataloader, lr_scheduler
     )
 
     # Load optimizer state after accelerator.prepare (device mapping is ready)
     if resume_dir is not None:
         load_optimizer_state(resume_dir, optimizer)
-        accelerator.print("Restored optimizer state.")
+        load_scheduler_state(resume_dir, lr_scheduler)
+        accelerator.print("Restored optimizer state and loaded scheduler state if present.")
 
     # Determine starting epoch and step from checkpoint
     start_epoch = int(resumed_state.get("epoch", 0))
@@ -219,7 +232,9 @@ def main() -> None:
     training_config_dict = {
         "learning_rate_lora": training_config.learning_rate_lora,
         "learning_rate_imm": training_config.learning_rate_imm,
-        "weight_decay": training_config.weight_decay,
+        "weight_decay_lora": training_config.weight_decay_lora,
+        "weight_decay_imm": training_config.weight_decay_imm,
+        "warmup_ratio": training_config.warmup_ratio,
         "batch_size": training_config.batch_size,
         "max_grad_norm": training_config.max_grad_norm,
         "grad_accum_steps": training_config.grad_accum_steps,
@@ -232,6 +247,7 @@ def main() -> None:
         f"batch_size={training_config.batch_size} "
         f"num_workers={training_config.num_workers} "
         f"grad_accum_steps={training_config.grad_accum_steps} "
+        f"warmup_steps={warmup_steps} "
         f"start_epoch={start_epoch} start_step={global_step}"
     )
 
@@ -275,6 +291,8 @@ def main() -> None:
                         model.parameters(), training_config.max_grad_norm
                     )
                 optimizer.step()
+                if accelerator.sync_gradients:
+                    lr_scheduler.step()
                 optimizer.zero_grad(set_to_none=True)
                 step_elapsed = time.time() - forward_start
 
@@ -305,6 +323,7 @@ def main() -> None:
                         checkpoint_dir=ckpt_dir.as_posix(),
                         model=accelerator.unwrap_model(model),
                         optimizer=optimizer,
+                        scheduler=lr_scheduler,
                         tokenizer=artifacts.tokenizer,
                         epoch=epoch_index,
                         global_step=global_step,
@@ -343,6 +362,7 @@ def main() -> None:
             checkpoint_dir=final_dir.as_posix(),
             model=accelerator.unwrap_model(model),
             optimizer=optimizer,
+            scheduler=lr_scheduler,
             tokenizer=artifacts.tokenizer,
             epoch=training_config.num_epochs,
             global_step=global_step,

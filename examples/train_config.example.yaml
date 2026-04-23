@@ -84,8 +84,15 @@ training:
   learning_rate_lora: 2.0e-4
   # Learning rate for IMM and other non-LoRA trainable parameters.
   learning_rate_imm: 2.0e-4
-  # AdamW weight decay applied to trainable parameter groups.
-  weight_decay: 0.01
+  # Linearly warm both LR groups for the first fraction of optimizer steps,
+  # then hold each group at its configured base LR.
+  warmup_ratio: 0.03
+  # AdamW weight decay for LoRA parameters. Set to 0.0 to disable.
+  weight_decay_lora: 0.0
+  # AdamW weight decay for IMM and other non-LoRA trainable parameters.
+  weight_decay_imm: 0.01
+  # Legacy single-value fallback; if set, it fills in missing *_weight_decay values.
+  # weight_decay: 0.01
   # Per-step micro-batch size before gradient accumulation.
   batch_size: 4
   # Number of worker processes for dataset tokenization/collation.
@@ -109,7 +116,8 @@ training:
   # Random seed for reproducible data order and initialization behavior.
   seed: 42
   # Path to a checkpoint directory to resume training from.
-  # Restores LoRA weights, IMM weights, optimizer state, epoch, and step.
+  # Restores LoRA weights, IMM weights, optimizer state, scheduler state,
+  # epoch, and step.
   # Can also be overridden via the --resume CLI argument.
   # resume_from_checkpoint: "outputs/imm_qwen/checkpoint_500"
   # Run validation every N global steps. Set to 0 to disable.

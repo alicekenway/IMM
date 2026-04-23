@@ -85,7 +85,10 @@ class ModelBuildConfig:
 class TrainingToolConfig:
     learning_rate_lora: float = 2e-4
     learning_rate_imm: float = 2e-4
-    weight_decay: float = 0.01
+    weight_decay: Optional[float] = None
+    weight_decay_lora: Optional[float] = None
+    weight_decay_imm: Optional[float] = None
+    warmup_ratio: float = 0.0
     batch_size: int = 4
     num_workers: int = 0
     num_epochs: int = 1
@@ -100,6 +103,22 @@ class TrainingToolConfig:
     eval_batch_size: int = 1
     eval_max_new_tokens: int = 128
     eval_temperature: float = 0.0
+
+    def __post_init__(self) -> None:
+        resolved_weight_decay = 0.01 if self.weight_decay is None else self.weight_decay
+        if self.weight_decay_lora is None:
+            object.__setattr__(self, "weight_decay_lora", resolved_weight_decay)
+        if self.weight_decay_imm is None:
+            object.__setattr__(self, "weight_decay_imm", resolved_weight_decay)
+
+        if self.weight_decay_lora is None or self.weight_decay_lora < 0.0:
+            raise ValueError("training.weight_decay_lora must be non-negative.")
+        if self.weight_decay_imm is None or self.weight_decay_imm < 0.0:
+            raise ValueError("training.weight_decay_imm must be non-negative.")
+        if self.weight_decay is not None and self.weight_decay < 0.0:
+            raise ValueError("training.weight_decay must be non-negative.")
+        if not 0.0 <= self.warmup_ratio <= 1.0:
+            raise ValueError("training.warmup_ratio must be between 0.0 and 1.0.")
 
 
 @dataclass(frozen=True)
