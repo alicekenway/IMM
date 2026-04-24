@@ -174,7 +174,6 @@ class ImplicitMemoryModule(nn.Module):
 
         weights = torch.softmax(scores, dim=-1)
 
-        any_valid = None
         if valid_mask is not None:
             any_valid = valid_mask.any(dim=-1, keepdim=True).unsqueeze(1)  # [B,1,1]
             weights = weights * any_valid.to(weights.dtype)
@@ -191,21 +190,7 @@ class ImplicitMemoryModule(nn.Module):
         )
 
         merged = self.output_proj(retrieved)
-        merged_states = self.merge_norm(hidden_states + merged)
-
-        active_mask = None
-        if any_valid is not None:
-            active_mask = any_valid
-        if history_lookup_mask is not None:
-            token_allowed = (~history_lookup_mask).unsqueeze(-1)
-            active_mask = token_allowed if active_mask is None else active_mask & token_allowed
-        if active_mask is not None:
-            # If a row has no valid memory, or a token is explicitly masked
-            # from memory lookup, IMM must be an exact no-op for that position.
-            # The merged branch is still built so DDP sees zero gradients
-            # instead of unused parameters on empty-history microbatches.
-            return torch.where(active_mask, merged_states, hidden_states)
-        return merged_states
+        return self.merge_norm(hidden_states + merged)
 
 
 # ---------------------------------------------------------------------------
@@ -502,19 +487,23 @@ class QwenImmAdapter(nn.Module):
         B, H, T_h = history_input_ids.shape
         device = present_input_ids.device
 
-        # --- fast path: truly no history tensor -------------------------------
-        # When a rank receives a microbatch whose samples all have empty
-        # history, the collator still provides one padded history slot with a
-        # fully-false ``history_line_mask``. That keeps IMM parameters in the
-        # autograd graph on every rank, which avoids DDP unused-parameter
-        # failures under multi-GPU training.
-        if H == 0:
-            return self.instrumented_model(
+        # --- fast path: no usable history in this local microbatch ------------
+        # Keep the same semantics as the original single-GPU path: if no sample
+        # has history, IMM must not alter hidden states.  The zero touch keeps
+        # DDP reducers satisfied when another rank does use IMM in the same step.
+        if H == 0 or not history_line_mask.any():
+            outputs = self.instrumented_model(
                 input_ids=present_input_ids,
                 attention_mask=present_attention_mask,
                 use_cache=False,
                 return_dict=True,
             )
+            zero_touch = outputs.logits.new_zeros(())
+            for parameter in self.parameters():
+                if parameter.requires_grad:
+                    zero_touch = zero_touch + parameter.sum() * 0.0
+            outputs.logits = outputs.logits + zero_touch
+            return outputs
 
         B_H = B * H
         T_p = present_input_ids.size(1)

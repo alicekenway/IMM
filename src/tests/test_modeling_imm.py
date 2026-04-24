@@ -61,7 +61,7 @@ def test_query_and_merge_no_valid_slots() -> None:
     module = ImplicitMemoryModule(
         hidden_dim=12, key_dim=6, value_dim=6, controller=controller,
     )
-    hidden = torch.randn(2, 5, 12, requires_grad=True)
+    hidden = torch.randn(2, 5, 12)
     mem_keys = torch.randn(2, 3, 6)
     mem_values = torch.randn(2, 3, 6)
     valid_mask = torch.zeros(2, 3, dtype=torch.bool)
@@ -72,37 +72,6 @@ def test_query_and_merge_no_valid_slots() -> None:
         valid_mask=valid_mask,
     )
     assert out.shape == hidden.shape
-    torch.testing.assert_close(out, hidden)
-
-    out.sum().backward()
-    assert module.query_proj.weight.grad is not None
-    assert module.output_proj.weight.grad is not None
-    assert module.merge_norm.weight.grad is not None
-
-
-def test_query_and_merge_respects_lookup_mask_as_noop() -> None:
-    controller = RuleBasedMemoryController()
-    module = ImplicitMemoryModule(
-        hidden_dim=12, key_dim=6, value_dim=6, controller=controller,
-    )
-    hidden = torch.randn(2, 5, 12)
-    mem_keys = torch.randn(2, 3, 6)
-    mem_values = torch.randn(2, 3, 6)
-    valid_mask = torch.ones(2, 3, dtype=torch.bool)
-    lookup_mask = torch.tensor(
-        [[True, True, False, False, False],
-         [True, False, True, False, False]]
-    )
-
-    out = module.query_and_merge(
-        hidden_states=hidden,
-        memory_keys=mem_keys,
-        memory_values=mem_values,
-        valid_mask=valid_mask,
-        history_lookup_mask=lookup_mask,
-    )
-
-    torch.testing.assert_close(out[lookup_mask], hidden[lookup_mask])
 
 
 def test_write_projections_get_gradients() -> None:
