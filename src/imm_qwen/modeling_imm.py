@@ -174,6 +174,7 @@ class ImplicitMemoryModule(nn.Module):
 
         weights = torch.softmax(scores, dim=-1)
 
+        any_valid = None
         if valid_mask is not None:
             any_valid = valid_mask.any(dim=-1, keepdim=True).unsqueeze(1)  # [B,1,1]
             weights = weights * any_valid.to(weights.dtype)
@@ -190,7 +191,21 @@ class ImplicitMemoryModule(nn.Module):
         )
 
         merged = self.output_proj(retrieved)
-        return self.merge_norm(hidden_states + merged)
+        merged_states = self.merge_norm(hidden_states + merged)
+
+        active_mask = None
+        if any_valid is not None:
+            active_mask = any_valid
+        if history_lookup_mask is not None:
+            token_allowed = (~history_lookup_mask).unsqueeze(-1)
+            active_mask = token_allowed if active_mask is None else active_mask & token_allowed
+        if active_mask is not None:
+            # If a row has no valid memory, or a token is explicitly masked
+            # from memory lookup, IMM must be an exact no-op for that position.
+            # The merged branch is still built so DDP sees zero gradients
+            # instead of unused parameters on empty-history microbatches.
+            return torch.where(active_mask, merged_states, hidden_states)
+        return merged_states
 
 
 # ---------------------------------------------------------------------------
