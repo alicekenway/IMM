@@ -117,6 +117,8 @@ class ImplicitMemoryModule(nn.Module):
         self.key_dim = key_dim
         self.value_dim = value_dim
         self.controller = controller
+        self.attention_score_scale = key_dim ** -0.5
+        self.merge_norm_mode = controller.config.merge_norm_mode
 
         self.query_proj = nn.Linear(hidden_dim, key_dim, bias=False)
         self.output_proj = nn.Linear(value_dim, hidden_dim, bias=False)
@@ -167,7 +169,10 @@ class ImplicitMemoryModule(nn.Module):
             [B, T, hidden_dim]
         """
         query = self.query_proj(hidden_states)                       # [B, T, key_dim]
-        scores = torch.einsum("btd,bnd->btn", query, memory_keys)   # [B, T, N]
+        scores = (
+            torch.einsum("btd,bnd->btn", query, memory_keys)
+            * self.attention_score_scale
+        )  # [B, T, N]
 
         if valid_mask is not None:
             scores = scores.masked_fill(~valid_mask.unsqueeze(1), -1e9)
@@ -190,6 +195,15 @@ class ImplicitMemoryModule(nn.Module):
         )
 
         merged = self.output_proj(retrieved)
+        if self.merge_norm_mode == "prenorm":
+            merged = self.merge_norm(merged)
+            if valid_mask is not None:
+                active_rows = valid_mask.any(dim=-1, keepdim=True).unsqueeze(1)
+                merged = merged * active_rows.to(merged.dtype)
+            if history_lookup_mask is not None:
+                active_tokens = (~history_lookup_mask).unsqueeze(-1)
+                merged = merged * active_tokens.to(merged.dtype)
+            return hidden_states + merged
         return self.merge_norm(hidden_states + merged)
 
 

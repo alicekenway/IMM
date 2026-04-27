@@ -24,6 +24,16 @@ class TurnSummaryConfig:
 class MemoryControllerConfig:
     # Session memory is long-term turn memory.
     session_merge_gate: float = 1.0
+    # "postnorm": LayerNorm(hidden + IMM_delta), current/default behavior.
+    # "prenorm": hidden + LayerNorm(IMM_delta), with inactive memory positions masked out.
+    merge_norm_mode: str = "postnorm"
+
+    def __post_init__(self) -> None:
+        valid_modes = {"postnorm", "prenorm"}
+        if self.merge_norm_mode not in valid_modes:
+            raise ValueError(
+                "controller.merge_norm_mode must be one of: postnorm, prenorm."
+            )
 
 
 @dataclass(frozen=True)

@@ -27,6 +27,10 @@ controller:
   # Strength of the retrieved session-memory contribution during merge.
   # 0.0 disables the session-memory effect; 1.0 keeps full strength.
   session_merge_gate: 1.0
+  # How to normalize the IMM merge.
+  # postnorm keeps the current behavior: LayerNorm(hidden + IMM_delta).
+  # prenorm uses residual adapter style: hidden + LayerNorm(IMM_delta).
+  merge_norm_mode: "postnorm"
 
 placement:
   # Master switch for inserting IMM modules into the transformer.
